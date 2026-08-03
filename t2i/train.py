@@ -252,6 +252,15 @@ def train(
 ):
     log_buffer = LogBuffer()
 
+    # [restore edit] anchor the perceptual warmup ramp to where this run starts
+    # (0 from scratch, resume step on resume). Guarded so upstream/non-restore
+    # use is unaffected.
+    try:
+        from restore.config import set_start_step
+        set_start_step(start_step)
+    except Exception:
+        pass
+
     global_step = start_step + 1
     skip_step = max(config.train.skip_step, global_step) % train_dataloader_len
     skip_step = skip_step if skip_step < (train_dataloader_len - 20) else 0
@@ -446,6 +455,12 @@ def train(
                                 repa_tokens = feats["tokens"][:, 1:]
                         elif isinstance(feats, torch.Tensor):
                             repa_tokens = feats[:, 1:]
+                # [restore edit] publish live step for the perceptual warmup ramp
+                try:
+                    from restore.config import set_step
+                    set_step(global_step)
+                except Exception:
+                    pass
                 loss_term = train_diffusion.training_losses(
                     model,
                     clean_images,
@@ -480,6 +495,24 @@ def train(
                 logs.update(repa_loss=accelerator.gather(repa_loss).mean().item())
             if grad_norm is not None:
                 logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
+            # [restore edit] surface the image-space terms and the warmup ramp.
+            # Upstream logs only the total loss, so a folded-in LPIPS/Gram term
+            # is indistinguishable from it being off -- and the ramp would be
+            # invisible. Guarded: absent keys simply do not appear.
+            try:
+                if isinstance(loss_term, dict):
+                    for _k in ("lpips", "gram", "flow"):
+                        if loss_term.get(_k) is not None:
+                            logs[_k] = accelerator.gather(
+                                loss_term[_k].mean() if hasattr(loss_term[_k], "mean")
+                                else loss_term[_k]
+                            ).mean().item()
+                from restore.config import get_active as _ga, get_step as _gs
+                _rc = _ga()
+                if _rc is not None and _rc.perceptual_enabled():
+                    logs["perceptual_warmup"] = _rc.perceptual_warmup_factor(_gs())
+            except Exception:
+                pass
             log_buffer.update(logs)
             if (step + 1) % config.train.log_interval == 0 or (step + 1) == 1:
                 accelerator.wait_for_everyone()
@@ -594,7 +627,15 @@ def train(
                     merged_state_dict = accelerator.get_state_dict(model)
 
                 accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
+                # [restore edit] Run validation on ALL ranks when not using FSDP,
+                # so the restoration hook can shard the pairs across GPUs (each
+                # rank samples records[rank::world_size] then gathers to rank 0).
+                # Upstream gated this on is_main_process, which deadlocks any
+                # collective inside log_validation. FSDP keeps the original
+                # main-process-only path: only the main process holds the merged
+                # weights, so non-main ranks must not sample.
+                _restore_run_val = (not config.train.use_fsdp) or accelerator.is_main_process
+                if _restore_run_val:
                     if config.train.use_fsdp:
                         model_instance.load_state_dict(merged_state_dict)
                     if validation_noise is not None:
