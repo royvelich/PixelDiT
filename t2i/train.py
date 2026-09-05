@@ -507,7 +507,7 @@ def train(
             try:
                 if isinstance(loss_term, dict):
                     for _k, _v in loss_term.items():
-                        if _k in ("loss", "extra") or _v is None:
+                        if _k in ("loss", "extra") or _k.startswith("_") or _v is None:
                             continue
                         if torch.is_tensor(_v):
                             logs[_k] = accelerator.gather(_v.detach().float().mean()).mean().item()

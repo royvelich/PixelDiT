@@ -519,6 +519,14 @@ class GaussianDiffusion:
             # Attach any model-provided extras (e.g., repa_loss)
             if extra_out is not None:
                 terms["extra"] = extra_out
+            # [restore edit] Publish the two tensors an image-space loss needs but cannot reach.
+            # The flow prediction is a VELOCITY, so a perceptual term must first recover
+            # x0 = x_t - sigma*v_pred, and both operands exist only inside this function. Exposing
+            # them here removes the need for a proxy wrapper around the model whose only job was
+            # to intercept them on the way past. Underscore-prefixed by convention: keys starting
+            # with "_" are internal plumbing and are skipped by the training-loop logger.
+            terms["_x_t"] = x_t
+            terms["_model_output"] = output
         else:
             raise NotImplementedError(self.loss_type)
 
