@@ -252,6 +252,16 @@ def train(
 ):
     log_buffer = LogBuffer()
 
+    # [restore edit] Anchor the perceptual warmup ramp to where THIS run starts (0 from
+    # scratch, the resume step on resume), so a resumed run ramps fresh instead of finding
+    # the ramp already in the past. Guarded so upstream / non-restore use is unaffected.
+    try:
+        from restore.config import set_start_step
+
+        set_start_step(start_step)
+    except Exception:
+        pass
+
     global_step = start_step + 1
     skip_step = max(config.train.skip_step, global_step) % train_dataloader_len
     skip_step = skip_step if skip_step < (train_dataloader_len - 20) else 0
@@ -446,6 +456,14 @@ def train(
                                 repa_tokens = feats["tokens"][:, 1:]
                         elif isinstance(feats, torch.Tensor):
                             repa_tokens = feats[:, 1:]
+                # [restore edit] Publish the live step: training_losses cannot see it from
+                # its own signature, and the perceptual warmup ramp needs it.
+                try:
+                    from restore.config import set_step
+
+                    set_step(global_step)
+                except Exception:
+                    pass
                 loss_term = train_diffusion.training_losses(
                     model,
                     clean_images,
@@ -480,6 +498,28 @@ def train(
                 logs.update(repa_loss=accelerator.gather(repa_loss).mean().item())
             if grad_norm is not None:
                 logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
+            # [restore edit] Surface every extra term training_losses returned. Upstream logs
+            # only the TOTAL, so a folded-in LPIPS / Gram / reference term is indistinguishable
+            # from it being switched off. Deliberately DATA-DRIVEN rather than a fixed key
+            # list: a new loss term added in restore.diffusion shows up here with no further
+            # edit to this file. "loss" is already reported as the total and "extra" is a dict
+            # handled above, so both are skipped.
+            try:
+                if isinstance(loss_term, dict):
+                    for _k, _v in loss_term.items():
+                        if _k in ("loss", "extra") or _v is None:
+                            continue
+                        if torch.is_tensor(_v):
+                            logs[_k] = accelerator.gather(_v.detach().float().mean()).mean().item()
+                        elif isinstance(_v, (int, float)):
+                            logs[_k] = float(_v)
+                from restore.config import get_active as _ga, get_step as _gs
+
+                _rc = _ga()
+                if _rc is not None and _rc.perceptual_enabled():
+                    logs["perceptual_warmup"] = _rc.perceptual_warmup_factor(_gs())
+            except Exception:
+                pass
             log_buffer.update(logs)
             if (step + 1) % config.train.log_interval == 0 or (step + 1) == 1:
                 accelerator.wait_for_everyone()
@@ -594,7 +634,14 @@ def train(
                     merged_state_dict = accelerator.get_state_dict(model)
 
                 accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
+                # [restore edit] Run validation on ALL ranks when not using FSDP, so the
+                # restoration hook can shard the validation pairs across GPUs (each rank takes
+                # records[rank::world_size], then gathers to rank 0). Upstream gated this on
+                # is_main_process, which deadlocks any collective inside log_validation.
+                # FSDP keeps the original main-process-only path: only the main process holds
+                # the merged weights, so non-main ranks must not sample.
+                _restore_run_val = (not config.train.use_fsdp) or accelerator.is_main_process
+                if _restore_run_val:
                     if config.train.use_fsdp:
                         model_instance.load_state_dict(merged_state_dict)
                     if validation_noise is not None:
