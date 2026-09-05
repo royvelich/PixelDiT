@@ -105,7 +105,12 @@ class PixDiTTrainer(nn.Module):
             nn.Linear(projector_dim, 768),
         )
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, repa_tokens=None, **kwargs):
+    def forward(self, x, timestep, y, mask=None, data_info=None, repa_tokens=None, num_views=1, **kwargs):
+        """``num_views`` > 1: ``x`` and ``timestep`` are per ROW (``B*V``, b-major), while ``y``
+        and ``mask`` are per SAMPLE (``B``) because the text stream is shared across a sample's
+        views. Forwarded verbatim to the core; the return shape is unchanged (``[B*V,3,H,W]``
+        under key ``"x"``), so every per-row loss downstream keeps working untouched.
+        """
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
         if y.dim() == 4:
@@ -125,7 +130,7 @@ class PixDiTTrainer(nn.Module):
         if hasattr(self.core, "last_repa_tokens"):
             self.core.last_repa_tokens = None
 
-        out = self.core(x, timestep, y_proc, s=None, mask=None)
+        out = self.core(x, timestep, y_proc, s=None, mask=None, num_views=num_views)
         repa_loss = None
         if repa_tokens is not None:
             repa_tokens = repa_tokens.to(self.dtype)
