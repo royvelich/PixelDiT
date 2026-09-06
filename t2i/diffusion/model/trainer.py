@@ -105,7 +105,7 @@ class PixDiTTrainer(nn.Module):
             nn.Linear(projector_dim, 768),
         )
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, repa_tokens=None, num_views=1, **kwargs):
+    def forward(self, x, timestep, y=None, mask=None, data_info=None, repa_tokens=None, num_views=1, **kwargs):
         """``num_views`` > 1: ``x`` and ``timestep`` are per ROW (``B*V``, b-major), while ``y``
         and ``mask`` are per SAMPLE (``B``) because the text stream is shared across a sample's
         views. Forwarded verbatim to the core; the return shape is unchanged (``[B*V,3,H,W]``
@@ -113,6 +113,13 @@ class PixDiTTrainer(nn.Module):
         """
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
+        if y is None:
+            # Text stream disabled: nothing to squeeze, check or cast. The core skips every
+            # text-shaped module rather than being fed zeros, so no text weight is touched.
+            if hasattr(self.core, "last_repa_tokens"):
+                self.core.last_repa_tokens = None
+            out = self.core(x, timestep, None, s=None, mask=None, num_views=num_views)
+            return {"x": out, "repa_loss": None}
         if y.dim() == 4:
             y_proc = y.squeeze(1)
         elif y.dim() == 3:
@@ -161,7 +168,7 @@ class PixDiTTrainer(nn.Module):
                     repa_loss = -((proj_tokens * repa_tokens).sum(dim=-1)).mean()
         return {"x": out, "repa_loss": repa_loss}
 
-    def forward_with_dpmsolver(self, x, timestep, y, mask=None, **kwargs):
+    def forward_with_dpmsolver(self, x, timestep, y=None, mask=None, **kwargs):
         out = self.forward(x, timestep, y, mask, **kwargs)
         if isinstance(out, dict):
             return out["x"]

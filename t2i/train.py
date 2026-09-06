@@ -92,6 +92,20 @@ def set_fsdp_env():
     os.environ["FSDP_OPTIMIZER_STATE_PRECISION"] = "fp32"
 
 
+def _restore_text_disabled() -> bool:
+    """[restore edit] True when the restoration wrapper has switched the text stream off.
+
+    Guarded so upstream and non-restore use are unaffected: with no restore config installed this
+    is always False and every text path below behaves exactly as before.
+    """
+    try:
+        from restore.config import text_disabled
+
+        return bool(text_disabled())
+    except Exception:
+        return False
+
+
 def ema_update(model_dest, model_src, rate):
     param_dict_src = dict(model_src.named_parameters())
     for p_name, p_dest in model_dest.named_parameters():
@@ -252,6 +266,10 @@ def train(
 ):
     log_buffer = LogBuffer()
 
+    # [restore edit] Recomputed here rather than threaded in: train() takes no restore argument, and
+    # the call is a cheap module-global read.
+    _train_no_text = _restore_text_disabled()
+
     # [restore edit] Anchor the perceptual warmup ramp to where THIS run starts (0 from
     # scratch, the resume step on resume), so a resumed run ramps fresh instead of finding
     # the ramp already in the past. Guarded so upstream / non-restore use is unaffected.
@@ -360,7 +378,11 @@ def train(
             lm_time_start = time.time()
             bs = clean_images.shape[0]
 
-            if load_text_feat:
+            # [restore edit] No text stream: the model takes y=None and skips every text-shaped
+            # module, rather than being handed zeros through weights it still pays to run.
+            if _train_no_text:
+                y = y_mask = None
+            elif load_text_feat:
                 y = batch[1]  # bs, 1, N, C
                 y_mask = batch[2]  # bs, 1, 1, N
             else:
@@ -821,7 +843,14 @@ def main(cfg: PixDiTConfig) -> None:
         else None
     )
     tokenizer = text_encoder = None
-    if not config.data.load_text_feat:
+    # [restore edit] With the text stream disabled there is nothing to encode, so the text encoder
+    # is not loaded at all -- Gemma-2-2b costs minutes of startup and several GB of VRAM for a model
+    # that would never be called. text_embed_dim falls back to the config value in the else branch,
+    # and every later text path is already guarded on `tokenizer is not None`.
+    _no_text = _restore_text_disabled()
+    if _no_text:
+        logger.info("[restore] text stream DISABLED: skipping the text-encoder load entirely")
+    if not config.data.load_text_feat and not _no_text:
         tokenizer, text_encoder = get_tokenizer_and_text_encoder(
             name=config.text_encoder.text_encoder_name, device=accelerator.device
         )

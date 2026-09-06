@@ -93,15 +93,22 @@ class MMDiTJointAttention(nn.Module):
             attn_mask: torch.Tensor = None,
             num_views: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Image tokens arrive at B*V (one row per view); the TEXT stream stays at B, shared
-        # across a sample's views. Merging text as well would duplicate it V times and let the
-        # copies diverge, so only the image slice joins the cross-view token axis.
+        # y is None when the text stream is disabled: the attention then runs single-stream over
+        # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
+        # no text weight is touched and none of its compute is paid.
+        #
+        # With text present: image tokens arrive at B*V (one row per view) while the TEXT stream
+        # stays at B, shared across a sample's views. Merging text as well would duplicate it V
+        # times and let the copies diverge, so only the image slice joins the cross-view token axis.
         B, Nx, C = x.shape
-        By, Ny, Cy = y.shape
-        assert C == Cy, "x and y must share the channel dim"
-        assert B == By * num_views, (
-            f"image batch {B} must be text batch {By} * num_views {num_views}"
-        )
+        text_on = y is not None
+        By = B // num_views
+        if text_on:
+            By, Ny, Cy = y.shape
+            assert C == Cy, "x and y must share the channel dim"
+            assert B == By * num_views, (
+                f"image batch {B} must be text batch {By} * num_views {num_views}"
+            )
 
         qkv_x = self.qkv_x(x).reshape(B, Nx, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
         qx, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
@@ -110,22 +117,24 @@ class MMDiTJointAttention(nn.Module):
 
         # Note the batch: image tokens are at B (== B*V), text at By. Using B here would be a
         # shape error at V>1 and a silent no-op at V=1.
-        qkv_y = self.qkv_y(y).reshape(By, Ny, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
-        qy, ky, vy = qkv_y[0], qkv_y[1], qkv_y[2]
-        qy = self.q_norm_y(qy)
-        ky = self.k_norm_y(ky)
+        if text_on:
+            qkv_y = self.qkv_y(y).reshape(By, Ny, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
+            qy, ky, vy = qkv_y[0], qkv_y[1], qkv_y[2]
+            qy = self.q_norm_y(qy)
+            ky = self.k_norm_y(ky)
 
         qx, kx = apply_rotary_emb(qx, kx, freqs_cis=pos_img)
-        if pos_txt is not None:
+        if text_on and pos_txt is not None:
             qy, ky = apply_rotary_emb(qy, ky, freqs_cis=pos_txt)
 
         qx = qx.transpose(1, 2)
         kx = kx.transpose(1, 2)
         vx = vx.transpose(1, 2)
 
-        qy = qy.transpose(1, 2)
-        ky = ky.transpose(1, 2)
-        vy = vy.transpose(1, 2)
+        if text_on:
+            qy = qy.transpose(1, 2)
+            ky = ky.transpose(1, 2)
+            vy = vy.transpose(1, 2)
 
         # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so each view must get
         # the same positional phase. Merging first would be identical here, but doing it last
@@ -134,18 +143,22 @@ class MMDiTJointAttention(nn.Module):
         kx = merge_views(kx, num_views)
         vx = merge_views(vx, num_views)
 
-        q_joint = torch.cat([qy, qx], dim=2)
-        k_joint = torch.cat([ky, kx], dim=2)
-        v_joint = torch.cat([vy, vx], dim=2)
+        if text_on:
+            q_joint = torch.cat([qy, qx], dim=2)
+            k_joint = torch.cat([ky, kx], dim=2)
+            v_joint = torch.cat([vy, vx], dim=2)
+        else:
+            q_joint, k_joint, v_joint = qx, kx, vx
 
         out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
-        out_y = out_joint[:, :, :Ny, :]
-        out_x = split_views(out_joint[:, :, Ny:, :], num_views, Nx)
-
-        out_y = out_y.transpose(1, 2).reshape(By, Ny, C)
+        n_txt = Ny if text_on else 0
+        out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
         out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
-
         out_x = self.proj_drop_x(self.proj_x(out_x))
+
+        if not text_on:
+            return out_x, None
+        out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(By, Ny, C)
         out_y = self.proj_drop_y(self.proj_y(out_y))
         return out_x, out_y
 
@@ -176,17 +189,21 @@ class MMDiTBlockT2I(nn.Module):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
         # exactly `c[::num_views]`. A no-op at num_views=1.
-        c_txt = c if num_views == 1 else c[::num_views]
+        text_on = y is not None
         shift_msa_x, scale_msa_x, gate_msa_x, shift_mlp_x, scale_mlp_x, gate_mlp_x = self.adaLN_modulation_img(c).chunk(6, dim=-1)
-        shift_msa_y, scale_msa_y, gate_msa_y, shift_mlp_y, scale_mlp_y, gate_mlp_y = self.adaLN_modulation_txt(c_txt).chunk(6, dim=-1)
+        if text_on:
+            c_txt = c if num_views == 1 else c[::num_views]
+            shift_msa_y, scale_msa_y, gate_msa_y, shift_mlp_y, scale_mlp_y, gate_mlp_y = self.adaLN_modulation_txt(c_txt).chunk(6, dim=-1)
 
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
-        y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y)
+        y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
         attn_x, attn_y = self.attn(x_norm, y_norm, pos_img, pos_txt, attn_mask, num_views)
         x = x + gate_msa_x * attn_x
-        y = y + gate_msa_y * attn_y
-
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
+        if not text_on:
+            return x, None
+
+        y = y + gate_msa_y * attn_y
         y = y + gate_mlp_y * self.mlp_y(apply_adaln(self.norm_y2(y), shift_mlp_y, scale_mlp_y))
         return x, y
 
@@ -308,7 +325,7 @@ class PixDiT_T2I(nn.Module):
         nn.init.zeros_(self.final_layer.linear.weight)
         nn.init.zeros_(self.final_layer.linear.bias)
 
-    def forward(self, x, t, y, s=None, mask=None, num_views=1):
+    def forward(self, x, t, y=None, s=None, mask=None, num_views=1):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
         blocks' joint attention. Everything else -- the pixel blocks, ``final_layer``, the
@@ -328,21 +345,27 @@ class PixDiT_T2I(nn.Module):
 
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
 
-        if y.dim() != 3:
-            raise ValueError("Text embedding y must be [B, L, D]")
-        Ltxt = min(y.shape[1], self.txt_max_length)
-        y = y[:, :Ltxt, :]
-        Btxt = y.shape[0]                     # == B // num_views
-        y_emb = self.y_embedder(y).view(Btxt, Ltxt, self.hidden_size)
-        y_emb = y_emb + self.y_pos_embedding[:, :Ltxt, :].to(y_emb.dtype)
+        text_on = y is not None
+        y_emb, Ltxt, Btxt = None, 0, B // num_views
+        if text_on:
+            if y.dim() != 3:
+                raise ValueError("Text embedding y must be [B, L, D]")
+            Ltxt = min(y.shape[1], self.txt_max_length)
+            y = y[:, :Ltxt, :]
+            Btxt = y.shape[0]                 # == B // num_views
+            y_emb = self.y_embedder(y).view(Btxt, Ltxt, self.hidden_size)
+            y_emb = y_emb + self.y_pos_embedding[:, :Ltxt, :].to(y_emb.dtype)
 
         condition = torch.nn.functional.silu(t_emb)
 
         if s is None:
             s0 = self.s_embedder(x_patches)
-            pos_txt = self.fetch_pos_text(Ltxt, x.device) if self.use_text_rope else None
+            pos_txt = (self.fetch_pos_text(Ltxt, x.device)
+                       if (text_on and self.use_text_rope) else None)
             attn_mask_joint = None
-            if mask is not None and isinstance(mask, torch.Tensor):
+            # The mask exists only to pad the TEXT axis; the image half is always all-False, so
+            # with no text there is nothing to mask and the whole tensor is skipped.
+            if text_on and mask is not None and isinstance(mask, torch.Tensor):
                 m = mask
                 while m.dim() > 2 and m.size(1) == 1:
                     m = m.squeeze(1)
