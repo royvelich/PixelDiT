@@ -501,7 +501,7 @@ def train(
             # invisible. Guarded: absent keys simply do not appear.
             try:
                 if isinstance(loss_term, dict):
-                    for _k in ("lpips", "gram", "flow"):
+                    for _k in ("lpips", "gram", "flow", "ref_recon"):
                         if loss_term.get(_k) is not None:
                             logs[_k] = accelerator.gather(
                                 loss_term[_k].mean() if hasattr(loss_term[_k], "mean")
