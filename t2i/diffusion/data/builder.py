@@ -23,7 +23,7 @@ import time
 from typing import Sequence
 
 from termcolor import colored
-from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
+from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler, SequentialSampler
 
 from diffusion.data.transforms import get_transform
 from diffusion.utils.logger import get_root_logger
@@ -235,3 +235,58 @@ class AspectRatioBatchSampler(BatchSampler):
                 if str(idx) in self.cached_idx:
                     continue
                 self.cached_idx[str(idx)] = self.data_all.pop(str(idx))
+
+
+class DistributedAspectRatioBatchSampler(AspectRatioBatchSampler):
+    """Shard complete aspect-homogeneous batches evenly across DDP ranks.
+
+    Grouping after a rank-local sampler can leave different ranks with different
+    numbers of complete buckets. All ranks instead build the same global batch
+    stream, then take one batch from each group of ``num_replicas`` batches.
+    """
+
+    def __init__(self, dataset, batch_size, aspect_ratios, num_replicas, rank, **kwargs):
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+        super().__init__(
+            sampler=SequentialSampler(dataset),
+            dataset=dataset,
+            batch_size=batch_size,
+            aspect_ratios=aspect_ratios,
+            **kwargs,
+        )
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.step_start = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def set_start(self, start):
+        self.step_start = max(int(start), 0)
+
+    def __len__(self):
+        if self.drop_last:
+            global_batches = sum(count // self.batch_size for count in self.ratio_nums_gt.values())
+        else:
+            global_batches = sum(
+                (count + self.batch_size - 1) // self.batch_size
+                for count in self.ratio_nums_gt.values()
+            )
+        return global_batches // self.num_replicas
+
+    def __iter__(self):
+        rank_group = []
+        local_step = 0
+        start_step = self.step_start // self.batch_size
+        for batch in super().__iter__():
+            rank_group.append(batch)
+            if len(rank_group) < self.num_replicas:
+                continue
+            if local_step >= start_step:
+                yield rank_group[self.rank]
+            local_step += 1
+            rank_group.clear()

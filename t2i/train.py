@@ -49,7 +49,7 @@ from diffusion.model.respace import compute_density_for_timestep_sampling
 from diffusion.model.utils import get_weight_dtype
 from diffusion.utils.checkpoint import load_checkpoint, save_checkpoint
 from diffusion.utils.config import PixDiTConfig, model_init_config
-from diffusion.data.builder import AspectRatioBatchSampler
+from diffusion.data.builder import AspectRatioBatchSampler, DistributedAspectRatioBatchSampler
 from diffusion.utils.dist_utils import flush, get_world_size
 from diffusion.utils.logger import LogBuffer, get_root_logger
 from diffusion.utils.lr_scheduler import build_lr_scheduler
@@ -104,6 +104,24 @@ def _restore_text_disabled() -> bool:
         return bool(text_disabled())
     except Exception:
         return False
+
+
+def _restore_active() -> bool:
+    """Return whether the restoration extension is installed for this process."""
+    try:
+        from restore.config import get_active
+
+        return get_active() is not None
+    except Exception:
+        return False
+
+
+def _should_visualize(config, global_step: int, local_step: int, restoration_active: bool) -> bool:
+    """Keep upstream epoch-start sampling, except when restoration owns validation scheduling."""
+    return bool(config.train.visualize) and (
+        global_step % config.train.eval_sampling_steps == 0
+        or (local_step == 0 and not restoration_active)
+    )
 
 
 def ema_update(model_dest, model_src, rate):
@@ -269,6 +287,7 @@ def train(
     # [restore edit] Recomputed here rather than threaded in: train() takes no restore argument, and
     # the call is a cheap module-global read.
     _train_no_text = _restore_text_disabled()
+    _restoration_active = _restore_active()
 
     # [restore edit] Anchor the perceptual warmup ramp to where THIS run starts (0 from
     # scratch, the resume step on resume), so a resumed run ramps fresh instead of finding
@@ -336,8 +355,9 @@ def train(
     # Now you train the model
     for epoch in range(start_epoch + 1, config.train.num_epochs + 1):
         time_start, last_tic = time.time(), time.time()
-        sampler = (
-            train_dataloader.batch_sampler.sampler
+        batch_sampler = train_dataloader.batch_sampler
+        sampler = batch_sampler if hasattr(batch_sampler, "set_start") else (
+            batch_sampler.sampler
             if (num_replicas > 1 or config.model.multi_scale)
             else train_dataloader.sampler
         )
@@ -651,7 +671,7 @@ def train(
                     logger.info(f"Stopping training at epoch {epoch}, step {global_step} due to time limit.")
                     return
 
-            if config.train.visualize and (global_step % config.train.eval_sampling_steps == 0 or (step + 1) == 1):
+            if _should_visualize(config, global_step, step, _restoration_active):
                 if config.train.use_fsdp:
                     merged_state_dict = accelerator.get_state_dict(model)
 
@@ -1075,7 +1095,14 @@ def main(cfg: PixDiTConfig) -> None:
         vae_downsample_rate=config.vae.vae_downsample_rate,
     )
     accelerator.wait_for_everyone()
-    if config.model.multi_scale:
+    use_distributed_aspect_batches = bool(
+        getattr(dataset, "requires_aspect_batching", False)
+    )
+    if use_distributed_aspect_batches and args.caching:
+        raise ValueError(
+            "Dataset-managed distributed aspect batching does not support --caching."
+        )
+    if config.model.multi_scale or use_distributed_aspect_batches:
         drop_last = True
         uuid = hashlib.sha256("-".join(config.data.data_dir).encode()).hexdigest()[:8]
         # Estimate cache file size: entries * avg bytes (tunable via env)
@@ -1098,9 +1125,7 @@ def main(cfg: PixDiTConfig) -> None:
         )
         cache_file = f"{base_pattern}-num_replicas{num_replicas}-rank{rank}-{dataset_key}.json"
 
-        sampler = DistributedRangedSampler(dataset, num_replicas=num_replicas, rank=rank)
-        batch_sampler = AspectRatioBatchSampler(
-            sampler=sampler,
+        batch_sampler_kwargs = dict(
             dataset=dataset,
             batch_size=config.train.train_batch_size,
             aspect_ratios=dataset.aspect_ratio,
@@ -1113,6 +1138,23 @@ def main(cfg: PixDiTConfig) -> None:
             caching=args.caching,
             clipscore_filter_thres=args.data.del_img_clip_thr,
         )
+        if use_distributed_aspect_batches:
+            batch_sampler = DistributedAspectRatioBatchSampler(
+                num_replicas=num_replicas,
+                rank=rank,
+                **batch_sampler_kwargs,
+            )
+            logger.info(
+                f"Using distributed aspect batches: {len(batch_sampler)} batches per rank"
+            )
+        else:
+            sampler = DistributedRangedSampler(
+                dataset, num_replicas=num_replicas, rank=rank
+            )
+            batch_sampler = AspectRatioBatchSampler(
+                sampler=sampler,
+                **batch_sampler_kwargs,
+            )
         train_dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=config.train.num_workers)
         train_dataloader_len = len(train_dataloader)
         logger.info(f"rank-{rank} Cached file len: {len(train_dataloader.batch_sampler.cached_idx)}")
