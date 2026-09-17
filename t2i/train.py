@@ -124,6 +124,15 @@ def _should_visualize(config, global_step: int, local_step: int, restoration_act
     )
 
 
+def _should_prepare_visualization_text(config, no_text: bool) -> bool:
+    """Prompt caches are upstream text-to-image inputs, not restoration validation inputs."""
+    return (
+        not no_text
+        and bool(config.train.visualize)
+        and bool(config.train.validation_prompts)
+    )
+
+
 def ema_update(model_dest, model_src, rate):
     param_dict_src = dict(model_src.named_parameters())
     for p_name, p_dest in model_dest.named_parameters():
@@ -895,6 +904,10 @@ def main(cfg: PixDiTConfig) -> None:
         config.train.null_embed_root,
         f"null_embed_diffusers_{safe_text_encoder_name}_{max_length}token_{text_embed_dim}.pth",
     )
+    if _no_text:
+        # A no-text model has no y_embedder, so loading image weights must not depend on a cached
+        # unconditional prompt tensor.
+        null_embed_path = None
 
     # training-time null prompt embedding for CFG dropout (when not loading text feat)
     null_y_train = None
@@ -912,7 +925,7 @@ def main(cfg: PixDiTConfig) -> None:
         null_y_mask = null_attention_mask_train[:, None, None, :]  # [1, 1, 1, L]
 
     # 2.preparing embeddings for visualization. We put it here for saving GPU memory
-    if config.train.visualize and len(config.train.validation_prompts):
+    if _should_prepare_visualization_text(config, _no_text):
         valid_prompt_embed_suffix = f"{max_length}token_{safe_text_encoder_name}_{text_embed_dim}.pth"
         validation_prompts = config.train.validation_prompts
         skip = True
