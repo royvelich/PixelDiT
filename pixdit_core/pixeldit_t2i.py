@@ -55,6 +55,54 @@ def split_views(t: torch.Tensor, num_views: int, tokens_per_view: int) -> torch.
     )
 
 
+class PatchGeometryEmbedder(nn.Module):
+    """Project per-patch camera/depth features into the image-token space.
+
+    The final projection is zero-initialized, so enabling the module leaves the
+    pretrained PixelDiT function exactly unchanged at step zero.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        dropout_probability: float = 0.0,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.dropout_probability = float(dropout_probability)
+        self.proj_in = nn.Linear(self.input_dim, int(hidden_dim))
+        self.proj_out = nn.Linear(int(hidden_dim), int(output_dim))
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, geometry: torch.Tensor, num_views: int) -> torch.Tensor:
+        if geometry.dim() != 3 or geometry.shape[-1] != self.input_dim:
+            raise ValueError(
+                "patch geometry must be [B*V,L,F] with "
+                f"F={self.input_dim}, got {tuple(geometry.shape)}"
+            )
+        if geometry.shape[0] % num_views:
+            raise ValueError(
+                f"patch geometry rows {geometry.shape[0]} are not divisible by "
+                f"num_views={num_views}"
+            )
+        if self.training and self.dropout_probability > 0:
+            samples = geometry.shape[0] // num_views
+            keep = (
+                torch.rand(
+                    samples, 1, 1, 1, device=geometry.device
+                )
+                >= self.dropout_probability
+            )
+            geometry = (
+                geometry.view(samples, num_views, *geometry.shape[1:])
+                * keep.to(geometry.dtype)
+            ).reshape_as(geometry)
+        return self.proj_out(F.silu(self.proj_in(geometry)))
+
+
 class MMDiTJointAttention(nn.Module):
     def __init__(
             self,
@@ -228,6 +276,10 @@ class PixDiT_T2I(nn.Module):
         repa_encoder_index: int = -1,
         use_pixel_abs_pos: bool = True,
         pit_adaln_post_modulation: bool = False,
+        patch_geometry_enabled: bool = False,
+        patch_geometry_input_dim: int = 11,
+        patch_geometry_hidden_dim: int = 256,
+        patch_geometry_dropout: float = 0.0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -246,6 +298,7 @@ class PixDiT_T2I(nn.Module):
         self.repa_encoder_index = int(repa_encoder_index)
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
+        self.patch_geometry_enabled = bool(patch_geometry_enabled)
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -289,6 +342,15 @@ class PixDiT_T2I(nn.Module):
             ]
         )
 
+        self.patch_geometry_embedder = None
+        if self.patch_geometry_enabled:
+            self.patch_geometry_embedder = PatchGeometryEmbedder(
+                patch_geometry_input_dim,
+                patch_geometry_hidden_dim,
+                self.hidden_size,
+                patch_geometry_dropout,
+            )
+
         self.final_layer = FinalLayer(self.pixel_hidden_size, self.out_channels)
 
         self.precompute_pos = dict()
@@ -325,7 +387,56 @@ class PixDiT_T2I(nn.Module):
         nn.init.zeros_(self.final_layer.linear.weight)
         nn.init.zeros_(self.final_layer.linear.bias)
 
-    def forward(self, x, t, y=None, s=None, mask=None, num_views=1):
+    @staticmethod
+    def _prepare_patch_geometry(
+        geometry: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        token_count: int,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        if geometry.dim() == 4:
+            if geometry.shape[1] != num_views:
+                raise ValueError(
+                    f"patch geometry has {geometry.shape[1]} views, "
+                    f"expected {num_views}"
+                )
+            geometry = geometry.reshape(
+                geometry.shape[0] * geometry.shape[1],
+                geometry.shape[2],
+                geometry.shape[3],
+            )
+        if geometry.dim() != 3:
+            raise ValueError(
+                f"patch geometry must be [B,V,L,F] or [B*V,L,F], "
+                f"got {tuple(geometry.shape)}"
+            )
+        if geometry.shape[1] != token_count:
+            raise ValueError(
+                f"patch geometry token count {geometry.shape[1]} != {token_count}"
+            )
+        if model_rows % geometry.shape[0]:
+            raise ValueError(
+                f"patch geometry rows {geometry.shape[0]} do not divide "
+                f"model rows {model_rows}"
+            )
+        if geometry.shape[0] != model_rows:
+            geometry = geometry.repeat(
+                model_rows // geometry.shape[0], 1, 1
+            )
+        return geometry.to(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x,
+        t,
+        y=None,
+        s=None,
+        mask=None,
+        num_views=1,
+        patch_geometry=None,
+    ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
         blocks' joint attention. Everything else -- the pixel blocks, ``final_layer``, the
@@ -360,6 +471,16 @@ class PixDiT_T2I(nn.Module):
 
         if s is None:
             s0 = self.s_embedder(x_patches)
+            if self.patch_geometry_embedder is not None and patch_geometry is not None:
+                geometry = self._prepare_patch_geometry(
+                    patch_geometry,
+                    B,
+                    num_views,
+                    L,
+                    x.device,
+                    s0.dtype,
+                )
+                s0 = s0 + self.patch_geometry_embedder(geometry, num_views)
             pos_txt = (self.fetch_pos_text(Ltxt, x.device)
                        if (text_on and self.use_text_rope) else None)
             attn_mask_joint = None
