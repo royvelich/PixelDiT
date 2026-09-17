@@ -259,8 +259,9 @@ def load_checkpoint_ddp(
     else:
         state_dict = checkpoint.get("state_dict", checkpoint)  # to be compatible with the official checkpoint
 
-    null_embed = torch.load(null_embed_path, map_location="cpu")
-    state_dict["y_embedder.y_embedding"] = null_embed["uncond_prompt_embeds"][0]
+    if null_embed_path is not None:
+        null_embed = torch.load(null_embed_path, map_location="cpu")
+        state_dict["y_embedder.y_embedding"] = null_embed["uncond_prompt_embeds"][0]
     rng_state = checkpoint.get("rng_state", None)
 
     missing, unexpect = model.load_state_dict(state_dict, strict=False)
