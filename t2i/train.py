@@ -309,6 +309,17 @@ def train(
         pass
 
     global_step = start_step + 1
+    max_train_steps = int(getattr(config.train, "max_train_steps", 0) or 0)
+    if max_train_steps < 0:
+        raise ValueError(
+            f"train.max_train_steps must be >= 0, got {max_train_steps}"
+        )
+    if max_train_steps and start_step >= max_train_steps:
+        raise ValueError(
+            "resume checkpoint is already at or beyond "
+            f"train.max_train_steps: start_step={start_step}, "
+            f"max_train_steps={max_train_steps}"
+        )
     skip_step = max(config.train.skip_step, global_step) % train_dataloader_len
     skip_step = skip_step if skip_step < (train_dataloader_len - 20) else 0
     loss_nan_timer = 0
@@ -628,12 +639,16 @@ def train(
                 accelerator.log(logs, step=global_step)
 
             global_step += 1
+            reached_max_train_steps = (
+                max_train_steps > 0 and global_step >= max_train_steps
+            )
 
             if loss_nan_timer > 20:
                 raise ValueError("Loss is NaN too much times. Break here.")
             if (
                 global_step % config.train.save_model_steps == 0
                 or (time.time() - training_start_time) / 3600 > config.train.early_stop_hours
+                or reached_max_train_steps
             ):
                 torch.cuda.synchronize()
                 accelerator.wait_for_everyone()
@@ -680,7 +695,15 @@ def train(
                     logger.info(f"Stopping training at epoch {epoch}, step {global_step} due to time limit.")
                     return
 
-            if _should_visualize(config, global_step, step, _restoration_active):
+            if (
+                _should_visualize(
+                    config, global_step, step, _restoration_active
+                )
+                or (
+                    reached_max_train_steps
+                    and bool(config.train.visualize)
+                )
+            ):
                 if config.train.use_fsdp:
                     merged_state_dict = accelerator.get_state_dict(model)
 
@@ -714,7 +737,16 @@ def train(
                             step=global_step,
                             device=accelerator.device,
                         )
-                
+
+            if reached_max_train_steps:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    logger.info(
+                        "[train] Reached "
+                        f"max_train_steps={max_train_steps} after final "
+                        "checkpoint and validation; stopping."
+                    )
+                return
 
             # avoid dead-lock of multiscale data batch sampler
             if (

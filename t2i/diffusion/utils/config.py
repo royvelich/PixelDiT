@@ -138,6 +138,10 @@ class TrainingConfig(BaseConfig):
     seed: int = 42
     train_batch_size: int = 32
     num_epochs: int = 100
+    # Absolute global-step boundary. Zero preserves the original epoch-only
+    # behavior. When set, train.py saves, validates (if enabled), and exits
+    # cleanly at this exact step, including after a checkpoint resume.
+    max_train_steps: int = 0
     gradient_accumulation_steps: int = 1
     grad_checkpointing: bool = False
     gradient_clip: float = 1.0
