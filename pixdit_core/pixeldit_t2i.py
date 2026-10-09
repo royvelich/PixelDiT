@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from typing import Tuple
 
@@ -1504,15 +1505,46 @@ class PixDiT_T2I(nn.Module):
                 reference_condition = torch.nn.functional.silu(
                     reference_t_emb
                 ).expand(-1, -1, L, -1)
-                s0, reference_s0 = self._run_reference_fusion(
-                    s0,
-                    reference_s0,
-                    render_condition,
-                    reference_condition,
-                    prepared_fusion_geometry,
-                    Hs,
-                    Ws,
-                )
+                if self.training and getattr(
+                    self, "grad_checkpointing", False
+                ):
+                    def _checkpointed_reference_fusion(
+                        render_tokens,
+                        reference_tokens,
+                        render_cond,
+                        reference_cond,
+                        fusion_geometry,
+                    ):
+                        return self._run_reference_fusion(
+                            render_tokens,
+                            reference_tokens,
+                            render_cond,
+                            reference_cond,
+                            fusion_geometry,
+                            Hs,
+                            Ws,
+                        )[0]
+
+                    s0 = checkpoint(
+                        _checkpointed_reference_fusion,
+                        s0,
+                        reference_s0,
+                        render_condition,
+                        reference_condition,
+                        prepared_fusion_geometry,
+                        use_reentrant=False,
+                    )
+                    reference_s0 = None
+                else:
+                    s0, reference_s0 = self._run_reference_fusion(
+                        s0,
+                        reference_s0,
+                        render_condition,
+                        reference_condition,
+                        prepared_fusion_geometry,
+                        Hs,
+                        Ws,
+                    )
             elif (
                 self.patch_geometry_embedder is not None
                 and patch_geometry is not None
