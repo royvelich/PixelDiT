@@ -66,6 +66,7 @@ class PixDiTTrainer(nn.Module):
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
+        reference_fusion_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -78,6 +79,11 @@ class PixDiTTrainer(nn.Module):
                 "patch_geometry_input_dim": 11,
                 "patch_geometry_hidden_dim": restore_cfg.patch_geometry_hidden_dim,
                 "patch_geometry_dropout": restore_cfg.patch_geometry_dropout,
+            }
+        if restore_cfg is not None:
+            reference_fusion_kwargs = {
+                "reference_fusion_mode": restore_cfg.ref_fusion_mode,
+                "reference_fusion_chunk_size": restore_cfg.ref_fusion_chunk_size,
             }
 
         if PixDiT_T2I is None:
@@ -101,6 +107,7 @@ class PixDiTTrainer(nn.Module):
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
+            **reference_fusion_kwargs,
         )
 
         self.image_size = int(image_size)

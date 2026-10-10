@@ -256,6 +256,53 @@ class MMDiTBlockT2I(nn.Module):
         return x, y
 
 
+class ReferenceLatentFusion(nn.Module):
+    """Fuse K target-token estimates while preserving the rank-0 estimate at initialization.
+
+    Input is ``[B,K,L,D]``: one target latent per independently processed
+    ``(target, reference_k)`` pair. Rank 0 is the anchor. Other references contribute gated
+    residuals relative to that anchor. The output projection is zero-initialized, so enabling
+    this module starts exactly at the existing rank-0 pairwise model rather than perturbing it.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNorm(dim, eps=1e-6)
+        self.gate_proj = nn.Linear(2 * dim, 1)
+        self.value_proj = nn.Linear(dim, dim, bias=False)
+        self.output_proj = nn.Linear(dim, dim, bias=False)
+        nn.init.zeros_(self.output_proj.weight)
+        self.last_gates = None
+
+    def forward(self, target_latents: torch.Tensor) -> torch.Tensor:
+        if target_latents.dim() != 4:
+            raise ValueError(
+                "reference fusion expects [B,K,L,D], "
+                f"got {tuple(target_latents.shape)}"
+            )
+        if target_latents.shape[1] < 1:
+            raise ValueError("reference fusion requires at least one reference branch")
+
+        anchor = target_latents[:, 0]
+        if target_latents.shape[1] == 1:
+            self.last_gates = target_latents.new_empty(
+                target_latents.shape[0], 0, target_latents.shape[2], 1
+            )
+            return anchor
+
+        normalized = self.norm(target_latents)
+        anchor_norm = normalized[:, :1]
+        deltas = normalized[:, 1:] - anchor_norm
+        gate_input = torch.cat(
+            [anchor_norm.expand_as(deltas), deltas],
+            dim=-1,
+        )
+        gates = torch.sigmoid(self.gate_proj(gate_input))
+        correction = (gates * self.value_proj(deltas)).sum(dim=1)
+        self.last_gates = gates.detach()
+        return anchor + self.output_proj(correction)
+
+
 class PixDiT_T2I(nn.Module):
     def __init__(
         self,
@@ -280,6 +327,8 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        reference_fusion_mode: str = "joint",
+        reference_fusion_chunk_size: int = 0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -299,6 +348,15 @@ class PixDiT_T2I(nn.Module):
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
+        self.reference_fusion_mode = str(reference_fusion_mode)
+        self.reference_fusion_chunk_size = int(reference_fusion_chunk_size)
+        if self.reference_fusion_mode not in ("joint", "pairwise_gated"):
+            raise ValueError(
+                "reference_fusion_mode must be joint|pairwise_gated, "
+                f"got {self.reference_fusion_mode!r}"
+            )
+        if self.reference_fusion_chunk_size < 0:
+            raise ValueError("reference_fusion_chunk_size must be >= 0")
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -351,6 +409,11 @@ class PixDiT_T2I(nn.Module):
                 patch_geometry_dropout,
             )
 
+        self.reference_fusion = (
+            ReferenceLatentFusion(self.hidden_size)
+            if self.reference_fusion_mode == "pairwise_gated"
+            else None
+        )
         self.final_layer = FinalLayer(self.pixel_hidden_size, self.out_channels)
 
         self.precompute_pos = dict()
@@ -427,6 +490,229 @@ class PixDiT_T2I(nn.Module):
             )
         return geometry.to(device=device, dtype=dtype)
 
+    @staticmethod
+    def _text_padding_mask(mask, batch_size: int, text_length: int, device):
+        """Normalize the caller's text-validity mask to ``[B,Ltxt]`` booleans."""
+        if mask is None or not isinstance(mask, torch.Tensor):
+            return None
+        m = mask
+        while m.dim() > 2 and m.size(1) == 1:
+            m = m.squeeze(1)
+        if m.dim() == 3 and m.size(1) == 1:
+            m = m.squeeze(1)
+        if m.dim() != 2:
+            return None
+        if m.shape[0] != batch_size:
+            raise ValueError(
+                f"text mask batch {m.shape[0]} != text batch {batch_size}"
+            )
+        return (m[:, :text_length] == 0).to(device=device)
+
+    @staticmethod
+    def _joint_attention_mask(text_padding, num_views: int, image_tokens: int):
+        if text_padding is None:
+            return None
+        batch_size, text_length = text_padding.shape
+        image_padding = torch.zeros(
+            (batch_size, num_views * image_tokens),
+            dtype=torch.bool,
+            device=text_padding.device,
+        )
+        return torch.cat([text_padding, image_padding], dim=1).view(
+            batch_size, 1, 1, text_length + num_views * image_tokens
+        )
+
+    def _run_patch_stack(
+        self,
+        s,
+        y_emb,
+        condition,
+        pos,
+        pos_txt,
+        attn_mask,
+        num_views,
+    ):
+        repa_tokens = None
+        for i, block in enumerate(self.patch_blocks):
+            s, y_emb = block(
+                s,
+                y_emb,
+                condition,
+                pos,
+                pos_txt,
+                attn_mask,
+                num_views,
+            )
+            if 0 < self.repa_encoder_index == (i + 1):
+                repa_tokens = s
+        return s, repa_tokens
+
+    def _pairwise_reference_patch_flow(
+        self,
+        s0,
+        t_emb,
+        y_emb,
+        text_padding,
+        pos,
+        pos_txt,
+        num_views,
+    ):
+        """Run the shared patch stack on K independent two-view batches and fuse targets."""
+        if num_views <= 1:
+            raise ValueError(
+                "pairwise_gated reference fusion requires num_views > 1"
+            )
+        model_rows, token_count, hidden_size = s0.shape
+        if model_rows % num_views:
+            raise ValueError(
+                f"model rows {model_rows} are not divisible by num_views={num_views}"
+            )
+        sample_count = model_rows // num_views
+        reference_count = num_views - 1
+        chunk_size = self.reference_fusion_chunk_size or reference_count
+        chunk_size = min(chunk_size, reference_count)
+
+        token_views = s0.view(
+            sample_count, num_views, token_count, hidden_size
+        )
+        condition_views = torch.nn.functional.silu(t_emb).view(
+            sample_count, num_views, 1, hidden_size
+        )
+        timestep_views = t_emb.view(sample_count, num_views, 1, hidden_size)
+        target_latent_chunks = []
+        repa_latent_chunks = []
+
+        for start in range(0, reference_count, chunk_size):
+            end = min(start + chunk_size, reference_count)
+            branches = end - start
+            reference_tokens = token_views[:, 1 + start:1 + end]
+            target_tokens = token_views[:, :1].expand(
+                -1, branches, -1, -1
+            )
+            pair_tokens = torch.stack(
+                [target_tokens, reference_tokens], dim=2
+            ).reshape(
+                sample_count * branches * 2, token_count, hidden_size
+            )
+
+            reference_condition = condition_views[:, 1 + start:1 + end]
+            target_condition = condition_views[:, :1].expand(
+                -1, branches, -1, -1
+            )
+            pair_condition = torch.stack(
+                [target_condition, reference_condition], dim=2
+            ).reshape(sample_count * branches * 2, 1, hidden_size)
+
+            pair_text = None
+            pair_padding = None
+            if y_emb is not None:
+                pair_text = y_emb[:, None].expand(
+                    -1, branches, -1, -1
+                ).reshape(
+                    sample_count * branches,
+                    y_emb.shape[1],
+                    hidden_size,
+                )
+                if text_padding is not None:
+                    pair_padding = text_padding[:, None].expand(
+                        -1, branches, -1
+                    ).reshape(sample_count * branches, text_padding.shape[1])
+
+            pair_mask = self._joint_attention_mask(
+                pair_padding, 2, token_count
+            )
+            pair_tokens, pair_repa_tokens = self._run_patch_stack(
+                pair_tokens,
+                pair_text,
+                pair_condition,
+                pos,
+                pos_txt,
+                pair_mask,
+                2,
+            )
+            if pair_repa_tokens is not None:
+                repa_latent_chunks.append(
+                    pair_repa_tokens.view(
+                        sample_count,
+                        branches,
+                        2,
+                        token_count,
+                        hidden_size,
+                    )[:, :, 0]
+                )
+            branch_targets = pair_tokens.view(
+                sample_count,
+                branches,
+                2,
+                token_count,
+                hidden_size,
+            )[:, :, 0]
+            target_timestep = timestep_views[:, :1].expand(
+                -1, branches, -1, -1
+            )
+            target_latent_chunks.append(
+                torch.nn.functional.silu(target_timestep + branch_targets)
+            )
+
+        target_latents = torch.cat(target_latent_chunks, dim=1)
+        fused = self.reference_fusion(target_latents)
+        if repa_latent_chunks:
+            self.last_repa_tokens = self.reference_fusion(
+                torch.cat(repa_latent_chunks, dim=1)
+            )
+        else:
+            self.last_repa_tokens = fused
+        return fused
+
+    def _run_pixel_path(self, x, s, height, width, token_count, mask):
+        rows = x.shape[0]
+        if s.shape[1] != token_count:
+            if s.shape[1] > token_count:
+                s = s[:, :token_count, :]
+            else:
+                s = torch.cat(
+                    [
+                        s,
+                        s.new_zeros(
+                            rows,
+                            token_count - s.shape[1],
+                            s.shape[2],
+                        ),
+                    ],
+                    dim=1,
+                )
+
+        s_cond = s.reshape(rows * token_count, self.hidden_size)
+        x_pixels = self.pixel_embedder(
+            x,
+            img_height=height,
+            img_width=width,
+            patch_size=self.patch_size,
+        )
+        for block in self.pixel_blocks:
+            x_pixels = block(
+                x_pixels,
+                s_cond,
+                height,
+                width,
+                self.patch_size,
+                mask,
+            )
+
+        x_pixels = self.final_layer(x_pixels)
+        channels = self.out_channels
+        patch_area = self.patch_size * self.patch_size
+        x_pixels = x_pixels.view(
+            rows, token_count, patch_area, channels
+        ).permute(0, 3, 2, 1).contiguous()
+        x_pixels = x_pixels.view(rows, channels * patch_area, token_count)
+        return torch.nn.functional.fold(
+            x_pixels,
+            (height, width),
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+
     def forward(
         self,
         x,
@@ -437,16 +723,32 @@ class PixDiT_T2I(nn.Module):
         num_views=1,
         patch_geometry=None,
     ):
-        """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
-        batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
-        blocks' joint attention. Everything else -- the pixel blocks, ``final_layer``, the
-        returned shape -- treats them as independent rows, so the output stays ``[B*V,3,H,W]``
-        and the caller reshapes if it wants a view axis. ``num_views=1`` is a bit-exact no-op.
+        """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major**.
+
+        In ``joint`` mode all views share one patch-attention token axis and every row continues
+        through the pixel pathway. In ``pairwise_gated`` mode, the shared patch stack processes
+        K independent ``(target, reference_k)`` pairs, their target patch latents are fused, and
+        only the target continues through the pixel pathway. Reference output rows are zero
+        velocity placeholders so the public ``[B*V,3,H,W]`` contract remains unchanged.
 
         ``t`` is per row (length ``B*V``); ``y`` and ``mask`` are per SAMPLE (length ``B``),
         because the text stream is shared across a sample's views.
         """
         B, _, H, W = x.shape          # B here is B*V: one row per (sample, view)
+        if B % num_views:
+            raise ValueError(f"batch {B} is not divisible by num_views={num_views}")
+        if self.reference_fusion_mode == "pairwise_gated" and num_views <= 1:
+            raise ValueError(
+                "pairwise_gated reference fusion requires num_views > 1"
+            )
+        if (
+            self.reference_fusion_mode == "pairwise_gated"
+            and num_views > 1
+            and s is not None
+        ):
+            raise ValueError(
+                "pairwise_gated reference fusion does not accept externally supplied patch tokens"
+            )
         Hs = H // self.patch_size
         Ws = W // self.patch_size
         L = Hs * Ws
@@ -464,6 +766,10 @@ class PixDiT_T2I(nn.Module):
             Ltxt = min(y.shape[1], self.txt_max_length)
             y = y[:, :Ltxt, :]
             Btxt = y.shape[0]                 # == B // num_views
+            if Btxt != B // num_views:
+                raise ValueError(
+                    f"text batch {Btxt} must equal image batch {B} / num_views {num_views}"
+                )
             y_emb = self.y_embedder(y).view(Btxt, Ltxt, self.hidden_size)
             y_emb = y_emb + self.y_pos_embedding[:, :Ltxt, :].to(y_emb.dtype)
 
@@ -483,51 +789,55 @@ class PixDiT_T2I(nn.Module):
                 s0 = s0 + self.patch_geometry_embedder(geometry, num_views)
             pos_txt = (self.fetch_pos_text(Ltxt, x.device)
                        if (text_on and self.use_text_rope) else None)
-            attn_mask_joint = None
-            # The mask exists only to pad the TEXT axis; the image half is always all-False, so
-            # with no text there is nothing to mask and the whole tensor is skipped.
-            if text_on and mask is not None and isinstance(mask, torch.Tensor):
-                m = mask
-                while m.dim() > 2 and m.size(1) == 1:
-                    m = m.squeeze(1)
-                if m.dim() == 3 and m.size(1) == 1:
-                    m = m.squeeze(1)
-                if m.dim() == 2:
-                    pad = (m == 0)
-                    # The key axis is [text | V*L image tokens] at batch Btxt after the merge.
-                    # Image tokens are never padded, so their half stays all-False.
-                    pad_img = torch.zeros((Btxt, num_views * L), dtype=torch.bool, device=x.device)
-                    attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(
-                        Btxt, 1, 1, Ltxt + num_views * L
-                    )
+            text_padding = (
+                self._text_padding_mask(mask, Btxt, Ltxt, x.device)
+                if text_on
+                else None
+            )
             self.last_repa_tokens = None
-            s = s0
-            for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
-                if 0 < self.repa_encoder_index == (i + 1):
-                    self.last_repa_tokens = s
+            if self.reference_fusion_mode == "pairwise_gated":
+                s = self._pairwise_reference_patch_flow(
+                    s0,
+                    t_emb,
+                    y_emb,
+                    text_padding,
+                    pos,
+                    pos_txt,
+                    num_views,
+                )
+                sample_count = B // num_views
+                x_target = x.view(
+                    sample_count, num_views, *x.shape[1:]
+                )[:, 0]
+                target_output = self._run_pixel_path(
+                    x_target, s, H, W, L, mask
+                )
+                reference_zeros = target_output.new_zeros(
+                    sample_count,
+                    num_views - 1,
+                    target_output.shape[1],
+                    H,
+                    W,
+                )
+                return torch.cat(
+                    [target_output[:, None], reference_zeros], dim=1
+                ).reshape(B, target_output.shape[1], H, W)
+
+            attn_mask_joint = self._joint_attention_mask(
+                text_padding, num_views, L
+            )
+            s, repa_tokens = self._run_patch_stack(
+                s0,
+                y_emb,
+                condition,
+                pos,
+                pos_txt,
+                attn_mask_joint,
+                num_views,
+            )
+            self.last_repa_tokens = repa_tokens
             s = torch.nn.functional.silu(t_emb + s)
         if not (0 < self.repa_encoder_index <= self.patch_depth):
             self.last_repa_tokens = s
 
-        batch_size, length, _ = s.shape
-        if length != L:
-            if length > L:
-                s = s[:, :L, :]
-            else:
-                pad_len = L - length
-                s = torch.cat([s, s.new_zeros(B, pad_len, s.shape[2])], dim=1)
-            length = L
-
-        s_cond = s.view(B * L, self.hidden_size)
-        x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
-        for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
-
-        x_pixels = self.final_layer(x_pixels)
-        C_out = self.out_channels
-        P2 = self.patch_size * self.patch_size
-        x_pixels = x_pixels.view(B, L, P2, C_out).permute(0, 3, 2, 1).contiguous()
-        x_pixels = x_pixels.view(B, C_out * P2, L)
-        x_img = torch.nn.functional.fold(x_pixels, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
-        return x_img
+        return self._run_pixel_path(x, s, H, W, L, mask)
