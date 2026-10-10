@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 
 from .pixeldit_c2i import PatchTokenEmbedder, PixelTokenEmbedder, PiTBlock
 from .modules import (
@@ -280,13 +280,33 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        patch_block_indices: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
         self.out_channels = int(in_channels)
         self.hidden_size = int(hidden_size)
         self.num_groups = int(num_groups)
-        self.patch_depth = int(patch_depth)
+        self.source_patch_depth = int(patch_depth)
+        if self.source_patch_depth <= 0:
+            raise ValueError("PixDiT_T2I expects patch_depth > 0")
+        if patch_block_indices is None:
+            selected_patch_blocks = tuple(range(self.source_patch_depth))
+        else:
+            selected_patch_blocks = tuple(int(index) for index in patch_block_indices)
+            if not selected_patch_blocks:
+                raise ValueError("patch_block_indices cannot be empty")
+            if tuple(sorted(set(selected_patch_blocks))) != selected_patch_blocks:
+                raise ValueError(
+                    "patch_block_indices must be unique and strictly increasing, "
+                    f"got {selected_patch_blocks}"
+                )
+            if selected_patch_blocks[0] < 0 or selected_patch_blocks[-1] >= self.source_patch_depth:
+                raise ValueError(
+                    "patch_block_indices must be within "
+                    f"[0, {self.source_patch_depth - 1}], got {selected_patch_blocks}"
+                )
+        self.patch_depth = len(selected_patch_blocks)
         self.pixel_depth = int(pixel_depth)
         self.num_text_blocks = int(num_text_blocks)
         self.patch_size = int(patch_size)
@@ -320,6 +340,15 @@ class PixDiT_T2I(nn.Module):
             )
             for _ in range(self.patch_depth)
         ])
+        self._patch_block_mapping_persistent = (
+            selected_patch_blocks != tuple(range(self.source_patch_depth))
+        )
+        self.register_buffer(
+            "_patch_block_source_indices",
+            torch.tensor(selected_patch_blocks, dtype=torch.int64),
+            persistent=self._patch_block_mapping_persistent,
+        )
+        self.register_load_state_dict_pre_hook(self._remap_patch_block_state_dict)
         self.text_refine_blocks = None
         self.pixel_attn_hidden_size = (
             int(pixel_attn_hidden_size) if pixel_attn_hidden_size is not None else self.hidden_size
@@ -358,6 +387,72 @@ class PixDiT_T2I(nn.Module):
         self.last_repa_tokens = None
 
         self.initialize_weights()
+
+    def _remap_patch_block_state_dict(
+        self,
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Map compact checkpoint block slots by their original source indices.
+
+        Official PixelDiT checkpoints predate ``_patch_block_source_indices`` and
+        therefore use dense source slots ``0..N-1``. Checkpoints saved by a
+        pruned model carry the buffer, so they can also be resumed or transferred
+        to a different retained-block subset without confusing compact slots with
+        original block identities.
+        """
+        del module, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        metadata_key = f"{prefix}_patch_block_source_indices"
+        block_prefix = f"{prefix}patch_blocks."
+        block_items = []
+        observed_slots = set()
+        for key in list(state_dict):
+            if not key.startswith(block_prefix):
+                continue
+            slot_text, separator, remainder = key[len(block_prefix):].partition(".")
+            if not separator or not slot_text.isdigit():
+                continue
+            slot = int(slot_text)
+            observed_slots.add(slot)
+            block_items.append((key, slot, remainder, state_dict[key]))
+
+        incoming_metadata = state_dict.get(metadata_key)
+        if incoming_metadata is None:
+            incoming_count = max(observed_slots) + 1 if observed_slots else 0
+            incoming_sources = tuple(range(incoming_count))
+        else:
+            incoming_sources = tuple(int(index) for index in incoming_metadata.tolist())
+
+        current_sources = tuple(int(index) for index in self._patch_block_source_indices.tolist())
+        current_slot_by_source = {
+            source_index: compact_slot
+            for compact_slot, source_index in enumerate(current_sources)
+        }
+        for key, _, _, _ in block_items:
+            del state_dict[key]
+        for _, incoming_slot, remainder, value in block_items:
+            if incoming_slot >= len(incoming_sources):
+                continue
+            source_index = incoming_sources[incoming_slot]
+            current_slot = current_slot_by_source.get(source_index)
+            if current_slot is None:
+                continue
+            state_dict[f"{block_prefix}{current_slot}.{remainder}"] = value
+
+        if self._patch_block_mapping_persistent:
+            # Consume legacy checkpoints without a missing-key warning and
+            # prevent differently shaped metadata from causing a mismatch.
+            state_dict[metadata_key] = self._patch_block_source_indices.detach().clone()
+        else:
+            # Preserve bit-exact state-dict compatibility for the default,
+            # unpruned architecture.
+            state_dict.pop(metadata_key, None)
 
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:

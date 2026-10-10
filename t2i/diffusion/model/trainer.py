@@ -66,12 +66,22 @@ class PixDiTTrainer(nn.Module):
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
+        patch_block_indices = None
         try:
             from restore.config import get_active
 
             restore_cfg = get_active()
         except ImportError:
             restore_cfg = None
+        if restore_cfg is not None:
+            configured_patch_blocks = restore_cfg.patch_block_indices_list()
+            if configured_patch_blocks:
+                if configured_patch_blocks[-1] >= patch_depth:
+                    raise ValueError(
+                        "restore.patch_block_indices contains source block "
+                        f"{configured_patch_blocks[-1]}, but model patch_depth is {patch_depth}"
+                    )
+                patch_block_indices = configured_patch_blocks
         if restore_cfg is not None and restore_cfg.patch_geometry:
             patch_geometry_kwargs = {
                 "patch_geometry_enabled": True,
@@ -100,6 +110,7 @@ class PixDiTTrainer(nn.Module):
             repa_encoder_index=repa_encoder_index,
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
+            patch_block_indices=patch_block_indices,
             **patch_geometry_kwargs,
         )
 
