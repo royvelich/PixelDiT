@@ -256,6 +256,139 @@ class MMDiTBlockT2I(nn.Module):
         return x, y
 
 
+class InterleavedReferenceHeadAttention(nn.Module):
+    """Fuse pairwise render updates across references with grouped attention.
+
+    The caller runs one ordinary render/reference MMDiT block per reference and
+    passes the resulting render-side residual updates as
+    ``[B,K,L,D]``.  For every patch and head, the current shared render produces
+    one query and every reference update produces one key.  Softmax is only
+    across the K references: there is deliberately no null/no-reference route.
+
+    Values are the unprojected head groups from the pairwise render updates.
+    This preserves the pretrained block update at K=1 exactly and avoids
+    introducing a second feature-generating path.  The key projection starts at
+    zero, so K>1 initially reduces to a stable uniform mean while still
+    receiving a non-zero first-step gradient through the non-zero query.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        score_dim: int = 32,
+        temperature: float = 1.0,
+    ):
+        super().__init__()
+        if num_heads <= 0 or dim % num_heads:
+            raise ValueError(
+                "interleaved reference attention requires dim divisible by "
+                f"num_heads, got dim={dim}, num_heads={num_heads}"
+            )
+        if score_dim <= 0:
+            raise ValueError("interleaved reference attention score_dim must be > 0")
+        if temperature <= 0:
+            raise ValueError(
+                "interleaved reference attention temperature must be > 0"
+            )
+
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.score_dim = int(score_dim)
+        self.temperature = float(temperature)
+
+        self.query_weight = nn.Parameter(
+            torch.empty(self.num_heads, self.head_dim, self.score_dim)
+        )
+        self.key_weight = nn.Parameter(
+            torch.empty(self.num_heads, self.head_dim, self.score_dim)
+        )
+        nn.init.xavier_uniform_(self.query_weight)
+        nn.init.zeros_(self.key_weight)
+
+        # Diagnostics only; never enters the state dict.
+        self.last_attention_weights = None
+
+    @staticmethod
+    def _rms_normalize(x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(
+            x.float().square().mean(dim=-1, keepdim=True).add(1e-6)
+        ).to(dtype=x.dtype)
+
+    def forward(
+        self,
+        render: torch.Tensor,
+        reference_updates: torch.Tensor,
+    ) -> torch.Tensor:
+        if render.dim() != 3:
+            raise ValueError(
+                f"render must be [B,L,D], got {tuple(render.shape)}"
+            )
+        if reference_updates.dim() != 4:
+            raise ValueError(
+                "reference_updates must be [B,K,L,D], got "
+                f"{tuple(reference_updates.shape)}"
+            )
+        if reference_updates.shape[1] < 1:
+            raise ValueError("at least one reference update is required")
+        if (
+            reference_updates.shape[0] != render.shape[0]
+            or reference_updates.shape[2:] != render.shape[1:]
+        ):
+            raise ValueError(
+                "render/reference update shapes are incompatible: "
+                f"{tuple(render.shape)} vs {tuple(reference_updates.shape)}"
+            )
+
+        # K=1 must reproduce the original rank-0 branch exactly.  Bypassing all
+        # projection arithmetic also makes old single-reference experiments a
+        # trustworthy compatibility test for this mode.
+        if reference_updates.shape[1] == 1:
+            self.last_attention_weights = reference_updates.new_ones(
+                reference_updates.shape[0],
+                1,
+                reference_updates.shape[2],
+                self.num_heads,
+            )
+            return reference_updates[:, 0]
+
+        batch, references, tokens, _ = reference_updates.shape
+        render_heads = render.view(
+            batch, tokens, self.num_heads, self.head_dim
+        )
+        update_heads = reference_updates.view(
+            batch, references, tokens, self.num_heads, self.head_dim
+        )
+        render_heads = self._rms_normalize(render_heads)
+        update_heads_norm = self._rms_normalize(update_heads)
+
+        queries = torch.einsum(
+            "blhd,hds->blhs",
+            render_heads,
+            self.query_weight,
+        )
+        keys = torch.einsum(
+            "bklhd,hds->bklhs",
+            update_heads_norm,
+            self.key_weight,
+        )
+        logits = torch.einsum(
+            "blhs,bklhs->bklh",
+            queries,
+            keys,
+        )
+        logits = logits * (self.score_dim ** -0.5) / self.temperature
+        weights = torch.softmax(logits.float(), dim=1).to(
+            dtype=reference_updates.dtype
+        )
+        fused_heads = (
+            weights[..., None] * update_heads
+        ).sum(dim=1)
+        self.last_attention_weights = weights.detach()
+        return fused_heads.reshape(batch, tokens, self.dim)
+
+
 class PixDiT_T2I(nn.Module):
     def __init__(
         self,
@@ -280,6 +413,10 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        interleaved_ref_attention_enabled: bool = False,
+        interleaved_ref_attention_heads: int = 0,
+        interleaved_ref_attention_score_dim: int = 32,
+        interleaved_ref_attention_temperature: float = 1.0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -299,6 +436,9 @@ class PixDiT_T2I(nn.Module):
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
+        self.interleaved_ref_attention_enabled = bool(
+            interleaved_ref_attention_enabled
+        )
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -320,6 +460,28 @@ class PixDiT_T2I(nn.Module):
             )
             for _ in range(self.patch_depth)
         ])
+        fusion_heads = (
+            int(interleaved_ref_attention_heads)
+            if int(interleaved_ref_attention_heads) > 0
+            else self.num_groups
+        )
+        self.interleaved_ref_fusions = (
+            nn.ModuleList(
+                [
+                    InterleavedReferenceHeadAttention(
+                        self.hidden_size,
+                        fusion_heads,
+                        score_dim=int(interleaved_ref_attention_score_dim),
+                        temperature=float(
+                            interleaved_ref_attention_temperature
+                        ),
+                    )
+                    for _ in range(self.patch_depth)
+                ]
+            )
+            if self.interleaved_ref_attention_enabled
+            else None
+        )
         self.text_refine_blocks = None
         self.pixel_attn_hidden_size = (
             int(pixel_attn_hidden_size) if pixel_attn_hidden_size is not None else self.hidden_size
@@ -494,16 +656,52 @@ class PixDiT_T2I(nn.Module):
                     m = m.squeeze(1)
                 if m.dim() == 2:
                     pad = (m == 0)
+                    attention_views = (
+                        2
+                        if (
+                            self.interleaved_ref_attention_enabled
+                            and num_views > 1
+                        )
+                        else num_views
+                    )
                     # The key axis is [text | V*L image tokens] at batch Btxt after the merge.
                     # Image tokens are never padded, so their half stays all-False.
-                    pad_img = torch.zeros((Btxt, num_views * L), dtype=torch.bool, device=x.device)
+                    pad_img = torch.zeros(
+                        (Btxt, attention_views * L),
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
                     attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(
-                        Btxt, 1, 1, Ltxt + num_views * L
+                        Btxt, 1, 1, Ltxt + attention_views * L
                     )
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
+                if (
+                    self.interleaved_ref_attention_enabled
+                    and num_views > 1
+                ):
+                    s, y_emb = self._interleaved_reference_block(
+                        self.patch_blocks[i],
+                        self.interleaved_ref_fusions[i],
+                        s,
+                        y_emb,
+                        condition,
+                        pos,
+                        pos_txt,
+                        attn_mask_joint,
+                        num_views,
+                    )
+                else:
+                    s, y_emb = self.patch_blocks[i](
+                        s,
+                        y_emb,
+                        condition,
+                        pos,
+                        pos_txt,
+                        attn_mask_joint,
+                        num_views,
+                    )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
@@ -531,3 +729,108 @@ class PixDiT_T2I(nn.Module):
         x_pixels = x_pixels.view(B, C_out * P2, L)
         x_img = torch.nn.functional.fold(x_pixels, (H, W), kernel_size=self.patch_size, stride=self.patch_size)
         return x_img
+
+    @staticmethod
+    def _interleaved_reference_block(
+        block: MMDiTBlockT2I,
+        fusion: InterleavedReferenceHeadAttention,
+        image_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        condition: torch.Tensor,
+        pos_img: torch.Tensor,
+        pos_txt: torch.Tensor,
+        attn_mask: torch.Tensor,
+        num_views: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run one shared-render/reference pair per reference, then fuse.
+
+        Rows use the repository-wide b-major convention
+        ``[sample0 render, sample0 ref0, ..., sample1 render, ...]``.
+        Every pair sees the same incoming render state.  Reference states remain
+        separate, while the K candidate render residual updates are fused into
+        the one render row supplied to the next patch block.
+        """
+        if num_views < 2:
+            raise ValueError(
+                "interleaved reference attention requires num_views >= 2"
+            )
+        rows, tokens, dim = image_tokens.shape
+        if rows % num_views:
+            raise ValueError(
+                f"image token rows {rows} are not divisible by num_views={num_views}"
+            )
+        if condition.shape[0] != rows:
+            raise ValueError(
+                f"condition rows {condition.shape[0]} do not match image rows {rows}"
+            )
+
+        batch = rows // num_views
+        references = num_views - 1
+        if references == 1:
+            # Preserve the original rank-0 architecture bit for bit.  In
+            # particular, avoid the otherwise harmless ``render + (candidate -
+            # render)`` round trip, which can change the last bit in bf16/fp32.
+            return block(
+                image_tokens,
+                text_tokens,
+                condition,
+                pos_img,
+                pos_txt,
+                attn_mask,
+                num_views=2,
+            )
+
+        views = image_tokens.view(batch, num_views, tokens, dim)
+        condition_views = condition.view(
+            batch, num_views, *condition.shape[1:]
+        )
+        render = views[:, 0]
+        render_condition = condition_views[:, 0]
+
+        render_candidates = []
+        reference_outputs = []
+        text_candidates = []
+        for reference_index in range(references):
+            reference = views[:, reference_index + 1]
+            reference_condition = condition_views[:, reference_index + 1]
+            pair_tokens = torch.stack(
+                [render, reference],
+                dim=1,
+            ).reshape(batch * 2, tokens, dim)
+            pair_condition = torch.stack(
+                [render_condition, reference_condition],
+                dim=1,
+            ).reshape(batch * 2, *condition.shape[1:])
+            pair_output, pair_text = block(
+                pair_tokens,
+                text_tokens,
+                pair_condition,
+                pos_img,
+                pos_txt,
+                attn_mask,
+                num_views=2,
+            )
+            pair_output = pair_output.view(batch, 2, tokens, dim)
+            render_candidates.append(pair_output[:, 0])
+            reference_outputs.append(pair_output[:, 1])
+            if pair_text is not None:
+                text_candidates.append(pair_text)
+
+        candidate_updates = (
+            torch.stack(render_candidates, dim=1)
+            - render[:, None]
+        )
+        render_next = render + fusion(render, candidate_updates)
+        references_next = torch.stack(reference_outputs, dim=1)
+        image_next = torch.cat(
+            [render_next[:, None], references_next],
+            dim=1,
+        ).reshape(rows, tokens, dim)
+
+        text_next = None
+        if text_candidates:
+            # Text remains one shared stream per sample.  Averaging the K
+            # pair-specific updates is permutation-invariant and exactly
+            # recovers the original behavior when K=1.
+            text_next = torch.stack(text_candidates, dim=0).mean(dim=0)
+        return image_next, text_next
