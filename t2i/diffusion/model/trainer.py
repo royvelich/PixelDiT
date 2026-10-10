@@ -84,6 +84,14 @@ class PixDiTTrainer(nn.Module):
             reference_fusion_kwargs = {
                 "reference_fusion_mode": restore_cfg.ref_fusion_mode,
                 "reference_fusion_chunk_size": restore_cfg.ref_fusion_chunk_size,
+                "reference_fusion_router_heads": restore_cfg.ref_fusion_router_heads,
+                "reference_fusion_router_hidden_dim": (
+                    restore_cfg.ref_fusion_router_hidden_dim
+                ),
+                "reference_fusion_temperature": restore_cfg.ref_fusion_temperature,
+                "reference_fusion_residual_scale_init": (
+                    restore_cfg.ref_fusion_residual_scale_init
+                ),
             }
 
         if PixDiT_T2I is None:

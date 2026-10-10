@@ -303,6 +303,144 @@ class ReferenceLatentFusion(nn.Module):
         return anchor + self.output_proj(correction)
 
 
+class CompetitiveReferenceLatentFusion(nn.Module):
+    """Symmetrically route aligned target estimates from K references.
+
+    ``reference_latents`` is ``[B,K,L,D]`` and ``target_only_latent`` is
+    ``[B,L,D]`` from a separate target-only patch-stack pass. The target-only
+    candidate is the null route. Every reference receives a per-patch,
+    per-head score from one shared router, and softmax competition across
+    ``{null, ref_0, ..., ref_{K-1}}`` keeps the correction scale independent of
+    K. No reference rank is structurally privileged.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        router_hidden_dim: int = 256,
+        temperature: float = 1.0,
+        residual_scale_init: float = 0.1,
+    ):
+        super().__init__()
+        if num_heads <= 0 or dim % num_heads:
+            raise ValueError(
+                f"competitive fusion requires dim divisible by num_heads, "
+                f"got dim={dim}, num_heads={num_heads}"
+            )
+        if router_hidden_dim <= 0:
+            raise ValueError("router_hidden_dim must be > 0")
+        if temperature <= 0:
+            raise ValueError("competitive fusion temperature must be > 0")
+        if residual_scale_init < 0:
+            raise ValueError("competitive fusion residual scale must be >= 0")
+
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.temperature = float(temperature)
+        self.norm = RMSNorm(dim, eps=1e-6)
+        self.router = nn.Sequential(
+            nn.Linear(4 * dim, router_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(router_hidden_dim, num_heads),
+        )
+        self.null_score_proj = nn.Linear(dim, num_heads)
+        self.value_proj = nn.Linear(dim, dim, bias=False)
+        self.output_proj = nn.Linear(dim, dim, bias=False)
+        self.residual_scale = nn.Parameter(
+            torch.tensor(float(residual_scale_init))
+        )
+
+        # Start close to uniform routing and make the initial correction a
+        # small, interpretable move toward the reference-conditioned candidates.
+        # Unlike a zero output projection, this lets the router and value path
+        # receive gradients from the first optimization step.
+        nn.init.normal_(self.router[-1].weight, std=1e-3)
+        nn.init.zeros_(self.router[-1].bias)
+        nn.init.normal_(self.null_score_proj.weight, std=1e-3)
+        nn.init.zeros_(self.null_score_proj.bias)
+        nn.init.eye_(self.value_proj.weight)
+        nn.init.eye_(self.output_proj.weight)
+
+        self.last_routing_weights = None
+        self.last_gates = None
+
+    def forward(
+        self,
+        reference_latents: torch.Tensor,
+        target_only_latent: torch.Tensor,
+    ) -> torch.Tensor:
+        if reference_latents.dim() != 4:
+            raise ValueError(
+                "competitive reference fusion expects reference latents "
+                f"[B,K,L,D], got {tuple(reference_latents.shape)}"
+            )
+        if target_only_latent.dim() != 3:
+            raise ValueError(
+                "competitive reference fusion expects target-only latent "
+                f"[B,L,D], got {tuple(target_only_latent.shape)}"
+            )
+        if reference_latents.shape[1] < 1:
+            raise ValueError(
+                "competitive reference fusion requires at least one reference branch"
+            )
+        if (
+            reference_latents.shape[0] != target_only_latent.shape[0]
+            or reference_latents.shape[2:] != target_only_latent.shape[1:]
+        ):
+            raise ValueError(
+                "reference and target-only latent shapes are incompatible: "
+                f"{tuple(reference_latents.shape)} vs "
+                f"{tuple(target_only_latent.shape)}"
+            )
+
+        batch, references, tokens, _ = reference_latents.shape
+        reference_norm = self.norm(reference_latents)
+        target_norm = self.norm(target_only_latent)
+        target_expanded = target_norm[:, None].expand_as(reference_norm)
+        reference_mean = reference_norm.mean(dim=1, keepdim=True)
+        reference_variance = (
+            (reference_norm - reference_mean).square().mean(dim=1, keepdim=True)
+        )
+        router_input = torch.cat(
+            [
+                target_expanded,
+                reference_norm - target_expanded,
+                (reference_mean - target_norm[:, None]).expand_as(reference_norm),
+                reference_variance.expand_as(reference_norm),
+            ],
+            dim=-1,
+        )
+        reference_logits = self.router(router_input)
+        null_logits = self.null_score_proj(target_norm)[:, None]
+        logits = torch.cat([null_logits, reference_logits], dim=1)
+        routing_weights = torch.softmax(
+            logits / self.temperature,
+            dim=1,
+        )
+
+        raw_deltas = reference_latents - target_only_latent[:, None]
+        values = self.value_proj(raw_deltas).view(
+            batch,
+            references,
+            tokens,
+            self.num_heads,
+            self.head_dim,
+        )
+        correction = (
+            routing_weights[:, 1:, :, :, None] * values
+        ).sum(dim=1).reshape(batch, tokens, self.dim)
+
+        self.last_routing_weights = routing_weights.detach()
+        # Alias the reference-only portion for existing gate diagnostics.
+        self.last_gates = routing_weights[:, 1:].detach()
+        return (
+            target_only_latent
+            + self.residual_scale * self.output_proj(correction)
+        )
+
+
 class PixDiT_T2I(nn.Module):
     def __init__(
         self,
@@ -329,6 +467,10 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_dropout: float = 0.0,
         reference_fusion_mode: str = "joint",
         reference_fusion_chunk_size: int = 0,
+        reference_fusion_router_heads: int = 8,
+        reference_fusion_router_hidden_dim: int = 256,
+        reference_fusion_temperature: float = 1.0,
+        reference_fusion_residual_scale_init: float = 0.1,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -350,9 +492,24 @@ class PixDiT_T2I(nn.Module):
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.reference_fusion_mode = str(reference_fusion_mode)
         self.reference_fusion_chunk_size = int(reference_fusion_chunk_size)
-        if self.reference_fusion_mode not in ("joint", "pairwise_gated"):
+        self.reference_fusion_router_heads = int(reference_fusion_router_heads)
+        self.reference_fusion_router_hidden_dim = int(
+            reference_fusion_router_hidden_dim
+        )
+        self.reference_fusion_temperature = float(
+            reference_fusion_temperature
+        )
+        self.reference_fusion_residual_scale_init = float(
+            reference_fusion_residual_scale_init
+        )
+        if self.reference_fusion_mode not in (
+            "joint",
+            "pairwise_gated",
+            "pairwise_competitive",
+        ):
             raise ValueError(
-                "reference_fusion_mode must be joint|pairwise_gated, "
+                "reference_fusion_mode must be "
+                "joint|pairwise_gated|pairwise_competitive, "
                 f"got {self.reference_fusion_mode!r}"
             )
         if self.reference_fusion_chunk_size < 0:
@@ -409,11 +566,18 @@ class PixDiT_T2I(nn.Module):
                 patch_geometry_dropout,
             )
 
-        self.reference_fusion = (
-            ReferenceLatentFusion(self.hidden_size)
-            if self.reference_fusion_mode == "pairwise_gated"
-            else None
-        )
+        if self.reference_fusion_mode == "pairwise_gated":
+            self.reference_fusion = ReferenceLatentFusion(self.hidden_size)
+        elif self.reference_fusion_mode == "pairwise_competitive":
+            self.reference_fusion = CompetitiveReferenceLatentFusion(
+                self.hidden_size,
+                num_heads=self.reference_fusion_router_heads,
+                router_hidden_dim=self.reference_fusion_router_hidden_dim,
+                temperature=self.reference_fusion_temperature,
+                residual_scale_init=self.reference_fusion_residual_scale_init,
+            )
+        else:
+            self.reference_fusion = None
         self.final_layer = FinalLayer(self.pixel_hidden_size, self.out_channels)
 
         self.precompute_pos = dict()
@@ -560,7 +724,7 @@ class PixDiT_T2I(nn.Module):
         """Run the shared patch stack on K independent two-view batches and fuse targets."""
         if num_views <= 1:
             raise ValueError(
-                "pairwise_gated reference fusion requires num_views > 1"
+                "pairwise reference fusion requires num_views > 1"
             )
         model_rows, token_count, hidden_size = s0.shape
         if model_rows % num_views:
@@ -581,6 +745,22 @@ class PixDiT_T2I(nn.Module):
         timestep_views = t_emb.view(sample_count, num_views, 1, hidden_size)
         target_latent_chunks = []
         repa_latent_chunks = []
+        target_only_latent = None
+        target_only_repa = None
+
+        if self.reference_fusion_mode == "pairwise_competitive":
+            target_only_tokens, target_only_repa = self._run_patch_stack(
+                token_views[:, 0],
+                y_emb,
+                condition_views[:, 0],
+                pos,
+                pos_txt,
+                self._joint_attention_mask(text_padding, 1, token_count),
+                1,
+            )
+            target_only_latent = torch.nn.functional.silu(
+                timestep_views[:, 0] + target_only_tokens
+            )
 
         for start in range(0, reference_count, chunk_size):
             end = min(start + chunk_size, reference_count)
@@ -655,11 +835,22 @@ class PixDiT_T2I(nn.Module):
             )
 
         target_latents = torch.cat(target_latent_chunks, dim=1)
-        fused = self.reference_fusion(target_latents)
-        if repa_latent_chunks:
-            self.last_repa_tokens = self.reference_fusion(
-                torch.cat(repa_latent_chunks, dim=1)
+        if self.reference_fusion_mode == "pairwise_competitive":
+            fused = self.reference_fusion(
+                target_latents,
+                target_only_latent,
             )
+        else:
+            fused = self.reference_fusion(target_latents)
+        if repa_latent_chunks:
+            repa_latents = torch.cat(repa_latent_chunks, dim=1)
+            if self.reference_fusion_mode == "pairwise_competitive":
+                self.last_repa_tokens = self.reference_fusion(
+                    repa_latents,
+                    target_only_repa,
+                )
+            else:
+                self.last_repa_tokens = self.reference_fusion(repa_latents)
         else:
             self.last_repa_tokens = fused
         return fused
@@ -726,10 +917,11 @@ class PixDiT_T2I(nn.Module):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major**.
 
         In ``joint`` mode all views share one patch-attention token axis and every row continues
-        through the pixel pathway. In ``pairwise_gated`` mode, the shared patch stack processes
-        K independent ``(target, reference_k)`` pairs, their target patch latents are fused, and
-        only the target continues through the pixel pathway. Reference output rows are zero
-        velocity placeholders so the public ``[B*V,3,H,W]`` contract remains unchanged.
+        through the pixel pathway. In either pairwise mode, the shared patch stack processes K
+        independent ``(target, reference_k)`` pairs, their target patch latents are fused, and
+        only the target continues through the pixel pathway. ``pairwise_competitive`` also runs
+        one target-only null branch. Reference output rows are zero velocity placeholders so the
+        public ``[B*V,3,H,W]`` contract remains unchanged.
 
         ``t`` is per row (length ``B*V``); ``y`` and ``mask`` are per SAMPLE (length ``B``),
         because the text stream is shared across a sample's views.
@@ -737,17 +929,21 @@ class PixDiT_T2I(nn.Module):
         B, _, H, W = x.shape          # B here is B*V: one row per (sample, view)
         if B % num_views:
             raise ValueError(f"batch {B} is not divisible by num_views={num_views}")
-        if self.reference_fusion_mode == "pairwise_gated" and num_views <= 1:
+        pairwise_fusion = self.reference_fusion_mode in (
+            "pairwise_gated",
+            "pairwise_competitive",
+        )
+        if pairwise_fusion and num_views <= 1:
             raise ValueError(
-                "pairwise_gated reference fusion requires num_views > 1"
+                "pairwise reference fusion requires num_views > 1"
             )
         if (
-            self.reference_fusion_mode == "pairwise_gated"
+            pairwise_fusion
             and num_views > 1
             and s is not None
         ):
             raise ValueError(
-                "pairwise_gated reference fusion does not accept externally supplied patch tokens"
+                "pairwise reference fusion does not accept externally supplied patch tokens"
             )
         Hs = H // self.patch_size
         Ws = W // self.patch_size
@@ -795,7 +991,7 @@ class PixDiT_T2I(nn.Module):
                 else None
             )
             self.last_repa_tokens = None
-            if self.reference_fusion_mode == "pairwise_gated":
+            if pairwise_fusion:
                 s = self._pairwise_reference_patch_flow(
                     s0,
                     t_emb,
