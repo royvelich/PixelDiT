@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -103,6 +105,135 @@ class PatchGeometryEmbedder(nn.Module):
         return self.proj_out(F.silu(self.proj_in(geometry)))
 
 
+class CameraPoseQKAttention(nn.Module):
+    """Pose-aware render-to-reference attention residual.
+
+    The pretrained joint attention remains untouched.  This branch reuses its
+    content Q/K/V, appends learned Plucker-ray features to render queries and
+    reference keys, and writes only to the render row.  Its output projection
+    starts at zero, so enabling the feature is an exact functional no-op before
+    training while still giving the new projection a direct first-step gradient.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        pose_input_dim: int = 6,
+        pose_head_dim: int = 16,
+    ):
+        super().__init__()
+        if dim % num_heads:
+            raise ValueError("camera-pose Q/K dim must be divisible by num_heads")
+        if pose_input_dim < 1 or pose_head_dim < 1:
+            raise ValueError("camera-pose Q/K dimensions must be positive")
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.pose_input_dim = int(pose_input_dim)
+        self.pose_head_dim = int(pose_head_dim)
+
+        pose_dim = self.num_heads * self.pose_head_dim
+        self.query_pose = nn.Linear(self.pose_input_dim, pose_dim, bias=False)
+        self.key_pose = nn.Linear(self.pose_input_dim, pose_dim, bias=False)
+        self.pose_logit_scale = nn.Parameter(torch.ones(self.num_heads))
+        self.out_proj = nn.Linear(self.dim, self.dim, bias=False)
+        nn.init.xavier_uniform_(self.query_pose.weight)
+        nn.init.xavier_uniform_(self.key_pose.weight)
+        nn.init.zeros_(self.out_proj.weight)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        camera_pose_rays: torch.Tensor,
+        num_views: int,
+    ) -> torch.Tensor:
+        """Return a render-only residual in ``[B*V,N,C]`` row layout."""
+        rows, heads, tokens, head_dim = query.shape
+        if heads != self.num_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"camera-pose Q/K received {tuple(query.shape)}, expected "
+                f"{self.num_heads} heads of width {self.head_dim}"
+            )
+        if num_views <= 1:
+            return query.new_zeros(rows, tokens, self.dim)
+        if rows % num_views:
+            raise ValueError(f"image rows {rows} are not divisible by num_views={num_views}")
+        if camera_pose_rays.shape != (rows, tokens, self.pose_input_dim):
+            raise ValueError(
+                "camera-pose rays must be "
+                f"{(rows, tokens, self.pose_input_dim)}, got "
+                f"{tuple(camera_pose_rays.shape)}"
+            )
+
+        batch = rows // num_views
+        refs = num_views - 1
+        query_views = query.view(batch, num_views, heads, tokens, head_dim)
+        key_views = key.view(batch, num_views, heads, tokens, head_dim)
+        value_views = value.view(batch, num_views, heads, tokens, head_dim)
+        ray_views = camera_pose_rays.view(
+            batch, num_views, tokens, self.pose_input_dim
+        )
+
+        render_query = query_views[:, 0]
+        reference_key = (
+            key_views[:, 1:]
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch, heads, refs * tokens, head_dim)
+        )
+        reference_value = (
+            value_views[:, 1:]
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch, heads, refs * tokens, head_dim)
+        )
+
+        query_pose = (
+            self.query_pose(ray_views[:, 0])
+            .view(batch, tokens, heads, self.pose_head_dim)
+            .permute(0, 2, 1, 3)
+        )
+        key_pose = (
+            self.key_pose(ray_views[:, 1:])
+            .view(batch, refs, tokens, heads, self.pose_head_dim)
+            .permute(0, 3, 1, 2, 4)
+            .reshape(batch, heads, refs * tokens, self.pose_head_dim)
+        )
+        # Unit-length geometry keeps translation scale and random projection
+        # magnitude from becoming an accidental attention temperature.  The
+        # learned per-head value directly controls the geometric logit scale.
+        query_pose = F.normalize(query_pose.float(), dim=-1).to(query.dtype)
+        key_pose = F.normalize(key_pose.float(), dim=-1).to(key.dtype)
+        pose_scale = self.pose_logit_scale.to(query.dtype).view(1, heads, 1, 1)
+        query_pose = query_pose * pose_scale * math.sqrt(self.head_dim)
+
+        pose_query = torch.cat([render_query, query_pose], dim=-1)
+        pose_key = torch.cat([reference_key, key_pose], dim=-1)
+        # Flash Attention requires Q, K and V to share a head width.  The padded
+        # value channels are exactly zero and discarded below, so they change
+        # neither the attention weights nor the appearance result.
+        pose_value = F.pad(reference_value, (0, self.pose_head_dim))
+        attended = F.scaled_dot_product_attention(
+            pose_query,
+            pose_key,
+            pose_value,
+            dropout_p=0.0,
+            scale=self.head_dim ** -0.5,
+        )
+        attended = attended[..., :self.head_dim]
+        attended = (
+            attended.transpose(1, 2)
+            .reshape(batch, tokens, self.dim)
+            .to(value.dtype)
+        )
+        render_delta = self.out_proj(attended)
+        reference_zeros = render_delta.new_zeros(batch, refs, tokens, self.dim)
+        return torch.cat([render_delta[:, None], reference_zeros], dim=1).reshape(
+            rows, tokens, self.dim
+        )
+
+
 class MMDiTJointAttention(nn.Module):
     def __init__(
             self,
@@ -131,6 +262,17 @@ class MMDiTJointAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop_x = nn.Dropout(proj_drop)
         self.proj_drop_y = nn.Dropout(proj_drop)
+        self.camera_pose_qk = None
+
+    def enable_camera_pose_qk(self, pose_head_dim: int) -> None:
+        if self.camera_pose_qk is not None:
+            raise RuntimeError("camera-pose Q/K attention is already enabled")
+        self.camera_pose_qk = CameraPoseQKAttention(
+            self.dim,
+            self.num_heads,
+            pose_input_dim=6,
+            pose_head_dim=pose_head_dim,
+        )
 
     def forward(
             self,
@@ -140,6 +282,7 @@ class MMDiTJointAttention(nn.Module):
             pos_txt: torch.Tensor = None,
             attn_mask: torch.Tensor = None,
             num_views: int = 1,
+            camera_pose_rays: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # y is None when the text stream is disabled: the attention then runs single-stream over
         # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
@@ -184,6 +327,8 @@ class MMDiTJointAttention(nn.Module):
             ky = ky.transpose(1, 2)
             vy = vy.transpose(1, 2)
 
+        qx_rows, kx_rows, vx_rows = qx, kx, vx
+
         # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so each view must get
         # the same positional phase. Merging first would be identical here, but doing it last
         # keeps the invariant obvious.
@@ -203,6 +348,19 @@ class MMDiTJointAttention(nn.Module):
         out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
         out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
         out_x = self.proj_drop_x(self.proj_x(out_x))
+        if self.camera_pose_qk is not None and num_views > 1:
+            if camera_pose_rays is None:
+                raise ValueError(
+                    "camera-pose Q/K attention requires camera_pose_rays "
+                    "when reference views are present"
+                )
+            out_x = out_x + self.camera_pose_qk(
+                qx_rows,
+                kx_rows,
+                vx_rows,
+                camera_pose_rays,
+                num_views,
+            )
 
         if not text_on:
             return out_x, None
@@ -233,7 +391,17 @@ class MMDiTBlockT2I(nn.Module):
         self.adaLN_modulation_img = adaLN_modulation_img if adaLN_modulation_img is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.adaLN_modulation_txt = adaLN_modulation_txt if adaLN_modulation_txt is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
-    def forward(self, x, y, c, pos_img, pos_txt=None, attn_mask=None, num_views=1):
+    def forward(
+        self,
+        x,
+        y,
+        c,
+        pos_img,
+        pos_txt=None,
+        attn_mask=None,
+        num_views=1,
+        camera_pose_rays=None,
+    ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
         # exactly `c[::num_views]`. A no-op at num_views=1.
@@ -245,7 +413,15 @@ class MMDiTBlockT2I(nn.Module):
 
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
         y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
-        attn_x, attn_y = self.attn(x_norm, y_norm, pos_img, pos_txt, attn_mask, num_views)
+        attn_x, attn_y = self.attn(
+            x_norm,
+            y_norm,
+            pos_img,
+            pos_txt,
+            attn_mask,
+            num_views,
+            camera_pose_rays,
+        )
         x = x + gate_msa_x * attn_x
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
         if not text_on:
@@ -280,6 +456,9 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        camera_pose_qk_enabled: bool = False,
+        camera_pose_qk_blocks=(),
+        camera_pose_qk_head_dim: int = 16,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -299,6 +478,7 @@ class PixDiT_T2I(nn.Module):
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
+        self.camera_pose_qk_enabled = bool(camera_pose_qk_enabled)
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -320,6 +500,25 @@ class PixDiT_T2I(nn.Module):
             )
             for _ in range(self.patch_depth)
         ])
+        self.camera_pose_qk_block_indices = frozenset()
+        if self.camera_pose_qk_enabled:
+            blocks = tuple(int(block) for block in camera_pose_qk_blocks)
+            if not blocks:
+                raise ValueError("camera-pose Q/K requires at least one patch block")
+            if len(set(blocks)) != len(blocks):
+                raise ValueError(f"camera-pose Q/K blocks contain duplicates: {blocks}")
+            if min(blocks) < 1 or max(blocks) > self.patch_depth:
+                raise ValueError(
+                    f"camera-pose Q/K blocks {blocks} exceed patch depth "
+                    f"{self.patch_depth}"
+                )
+            self.camera_pose_qk_block_indices = frozenset(
+                block - 1 for block in blocks
+            )
+            for block_index in self.camera_pose_qk_block_indices:
+                self.patch_blocks[block_index].attn.enable_camera_pose_qk(
+                    camera_pose_qk_head_dim
+                )
         self.text_refine_blocks = None
         self.pixel_attn_hidden_size = (
             int(pixel_attn_hidden_size) if pixel_attn_hidden_size is not None else self.hidden_size
@@ -427,6 +626,44 @@ class PixDiT_T2I(nn.Module):
             )
         return geometry.to(device=device, dtype=dtype)
 
+    @staticmethod
+    def _prepare_camera_pose_rays(
+        rays: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        token_count: int,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        if rays.dim() == 4:
+            if rays.shape[1] != num_views:
+                raise ValueError(
+                    f"camera-pose rays have {rays.shape[1]} views, "
+                    f"expected {num_views}"
+                )
+            rays = rays.reshape(
+                rays.shape[0] * rays.shape[1],
+                rays.shape[2],
+                rays.shape[3],
+            )
+        if rays.dim() != 3 or rays.shape[-1] != 6:
+            raise ValueError(
+                "camera-pose rays must be [B,V,L,6] or [B*V,L,6], "
+                f"got {tuple(rays.shape)}"
+            )
+        if rays.shape[1] != token_count:
+            raise ValueError(
+                f"camera-pose ray token count {rays.shape[1]} != {token_count}"
+            )
+        if model_rows % rays.shape[0]:
+            raise ValueError(
+                f"camera-pose ray rows {rays.shape[0]} do not divide "
+                f"model rows {model_rows}"
+            )
+        if rays.shape[0] != model_rows:
+            rays = rays.repeat(model_rows // rays.shape[0], 1, 1)
+        return rays.to(device=device, dtype=dtype)
+
     def forward(
         self,
         x,
@@ -436,6 +673,7 @@ class PixDiT_T2I(nn.Module):
         mask=None,
         num_views=1,
         patch_geometry=None,
+        camera_pose_rays=None,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -481,6 +719,21 @@ class PixDiT_T2I(nn.Module):
                     s0.dtype,
                 )
                 s0 = s0 + self.patch_geometry_embedder(geometry, num_views)
+            pose_rays = None
+            if self.camera_pose_qk_enabled and num_views > 1:
+                if camera_pose_rays is None:
+                    raise ValueError(
+                        "camera-pose Q/K attention requires camera_pose_rays "
+                        "when reference views are present"
+                    )
+                pose_rays = self._prepare_camera_pose_rays(
+                    camera_pose_rays,
+                    B,
+                    num_views,
+                    L,
+                    x.device,
+                    s0.dtype,
+                )
             pos_txt = (self.fetch_pos_text(Ltxt, x.device)
                        if (text_on and self.use_text_rope) else None)
             attn_mask_joint = None
@@ -503,7 +756,20 @@ class PixDiT_T2I(nn.Module):
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
+                s, y_emb = self.patch_blocks[i](
+                    s,
+                    y_emb,
+                    condition,
+                    pos,
+                    pos_txt,
+                    attn_mask_joint,
+                    num_views,
+                    camera_pose_rays=(
+                        pose_rays
+                        if i in self.camera_pose_qk_block_indices
+                        else None
+                    ),
+                )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)

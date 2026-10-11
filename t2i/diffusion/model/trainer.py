@@ -66,6 +66,7 @@ class PixDiTTrainer(nn.Module):
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
+        camera_pose_qk_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -78,6 +79,12 @@ class PixDiTTrainer(nn.Module):
                 "patch_geometry_input_dim": 11,
                 "patch_geometry_hidden_dim": restore_cfg.patch_geometry_hidden_dim,
                 "patch_geometry_dropout": restore_cfg.patch_geometry_dropout,
+            }
+        if restore_cfg is not None and restore_cfg.camera_pose_qk:
+            camera_pose_qk_kwargs = {
+                "camera_pose_qk_enabled": True,
+                "camera_pose_qk_blocks": restore_cfg.camera_pose_qk_blocks_list(),
+                "camera_pose_qk_head_dim": restore_cfg.camera_pose_qk_head_dim,
             }
 
         if PixDiT_T2I is None:
@@ -101,6 +108,7 @@ class PixDiTTrainer(nn.Module):
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
+            **camera_pose_qk_kwargs,
         )
 
         self.image_size = int(image_size)
@@ -133,6 +141,11 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        camera_pose_rays = (
+            data_info.get("camera_pose_rays")
+            if isinstance(data_info, dict)
+            else None
+        )
         if y is None:
             # Text stream disabled: nothing to squeeze, check or cast. The core skips every
             # text-shaped module rather than being fed zeros, so no text weight is touched.
@@ -146,6 +159,7 @@ class PixDiTTrainer(nn.Module):
                 mask=None,
                 num_views=num_views,
                 patch_geometry=patch_geometry,
+                camera_pose_rays=camera_pose_rays,
             )
             return {"x": out, "repa_loss": None}
         if y.dim() == 4:
@@ -173,6 +187,7 @@ class PixDiTTrainer(nn.Module):
             mask=None,
             num_views=num_views,
             patch_geometry=patch_geometry,
+            camera_pose_rays=camera_pose_rays,
         )
         repa_loss = None
         if repa_tokens is not None:
