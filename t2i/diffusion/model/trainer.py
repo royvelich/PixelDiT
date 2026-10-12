@@ -66,6 +66,7 @@ class PixDiTTrainer(nn.Module):
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
+        camera_pose_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -78,6 +79,11 @@ class PixDiTTrainer(nn.Module):
                 "patch_geometry_input_dim": 11,
                 "patch_geometry_hidden_dim": restore_cfg.patch_geometry_hidden_dim,
                 "patch_geometry_dropout": restore_cfg.patch_geometry_dropout,
+            }
+        if restore_cfg is not None:
+            camera_pose_kwargs = {
+                "camera_pose_mode": restore_cfg.camera_pose_mode,
+                "prope_freq_base": restore_cfg.prope_freq_base,
             }
 
         if PixDiT_T2I is None:
@@ -101,6 +107,7 @@ class PixDiTTrainer(nn.Module):
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
+            **camera_pose_kwargs,
         )
 
         self.image_size = int(image_size)
@@ -133,6 +140,16 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        prope_w2cs = (
+            data_info.get("prope_w2cs")
+            if isinstance(data_info, dict)
+            else None
+        )
+        prope_intrinsics = (
+            data_info.get("prope_intrinsics")
+            if isinstance(data_info, dict)
+            else None
+        )
         if y is None:
             # Text stream disabled: nothing to squeeze, check or cast. The core skips every
             # text-shaped module rather than being fed zeros, so no text weight is touched.
@@ -146,6 +163,8 @@ class PixDiTTrainer(nn.Module):
                 mask=None,
                 num_views=num_views,
                 patch_geometry=patch_geometry,
+                prope_w2cs=prope_w2cs,
+                prope_intrinsics=prope_intrinsics,
             )
             return {"x": out, "repa_loss": None}
         if y.dim() == 4:
@@ -173,6 +192,8 @@ class PixDiTTrainer(nn.Module):
             mask=None,
             num_views=num_views,
             patch_geometry=patch_geometry,
+            prope_w2cs=prope_w2cs,
+            prope_intrinsics=prope_intrinsics,
         )
         repa_loss = None
         if repa_tokens is not None:

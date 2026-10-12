@@ -14,6 +14,7 @@ from .modules import (
     apply_rotary_emb,
     precompute_freqs_cis_2d,
 )
+from .prope import PropeDotProductAttention
 
 
 def merge_views(t: torch.Tensor, num_views: int) -> torch.Tensor:
@@ -111,6 +112,8 @@ class MMDiTJointAttention(nn.Module):
             qkv_bias: bool = False,
             attn_drop: float = 0.,
             proj_drop: float = 0.,
+            joint_prope_enabled: bool = False,
+            prope_freq_base: float = 100.0,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -131,6 +134,14 @@ class MMDiTJointAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop_x = nn.Dropout(proj_drop)
         self.proj_drop_y = nn.Dropout(proj_drop)
+        self.joint_prope = (
+            PropeDotProductAttention(
+                self.head_dim,
+                freq_base=prope_freq_base,
+            )
+            if joint_prope_enabled
+            else None
+        )
 
     def forward(
             self,
@@ -140,6 +151,9 @@ class MMDiTJointAttention(nn.Module):
             pos_txt: torch.Tensor = None,
             attn_mask: torch.Tensor = None,
             num_views: int = 1,
+            prope_w2cs: torch.Tensor = None,
+            prope_intrinsics: torch.Tensor = None,
+            patch_grid=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # y is None when the text stream is disabled: the attention then runs single-stream over
         # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
@@ -171,7 +185,12 @@ class MMDiTJointAttention(nn.Module):
             qy = self.q_norm_y(qy)
             ky = self.k_norm_y(ky)
 
-        qx, kx = apply_rotary_emb(qx, kx, freqs_cis=pos_img)
+        if self.joint_prope is None:
+            qx, kx = apply_rotary_emb(qx, kx, freqs_cis=pos_img)
+        elif text_on:
+            raise ValueError(
+                "joint PRoPE is image-only; disable the text stream"
+            )
         if text_on and pos_txt is not None:
             qy, ky = apply_rotary_emb(qy, ky, freqs_cis=pos_txt)
 
@@ -191,6 +210,41 @@ class MMDiTJointAttention(nn.Module):
         kx = merge_views(kx, num_views)
         vx = merge_views(vx, num_views)
 
+        if self.joint_prope is not None:
+            if prope_w2cs is None or prope_intrinsics is None:
+                raise ValueError(
+                    "joint PRoPE requires camera extrinsics and intrinsics"
+                )
+            if patch_grid is None or len(patch_grid) != 2:
+                raise ValueError("joint PRoPE requires a (height, width) patch grid")
+            patch_height, patch_width = (int(v) for v in patch_grid)
+            expected_batch = B // num_views
+            if prope_w2cs.shape != (expected_batch, num_views, 4, 4):
+                raise ValueError(
+                    "joint PRoPE view matrices must be "
+                    f"{(expected_batch, num_views, 4, 4)}, "
+                    f"got {tuple(prope_w2cs.shape)}"
+                )
+            if prope_intrinsics.shape != (expected_batch, num_views, 3, 3):
+                raise ValueError(
+                    "joint PRoPE intrinsics must be "
+                    f"{(expected_batch, num_views, 3, 3)}, "
+                    f"got {tuple(prope_intrinsics.shape)}"
+                )
+            self.joint_prope.update_coeffs(
+                patch_width,
+                patch_height,
+                qx.device,
+            )
+            self.joint_prope.prepare(
+                prope_w2cs.float(),
+                prope_intrinsics.float(),
+            )
+            query_dtype = qx.dtype
+            qx = self.joint_prope.apply_to_q(qx.float()).to(query_dtype)
+            kx = self.joint_prope.apply_to_kv(kx.float()).to(query_dtype)
+            vx = self.joint_prope.apply_to_kv(vx.float()).to(query_dtype)
+
         if text_on:
             q_joint = torch.cat([qy, qx], dim=2)
             k_joint = torch.cat([ky, kx], dim=2)
@@ -199,6 +253,11 @@ class MMDiTJointAttention(nn.Module):
             q_joint, k_joint, v_joint = qx, kx, vx
 
         out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
+        if self.joint_prope is not None:
+            output_dtype = out_joint.dtype
+            out_joint = self.joint_prope.apply_to_output(
+                out_joint.float()
+            ).to(output_dtype)
         n_txt = Ny if text_on else 0
         out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
         out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
@@ -212,7 +271,16 @@ class MMDiTJointAttention(nn.Module):
 
 
 class MMDiTBlockT2I(nn.Module):
-    def __init__(self, hidden_size, groups, mlp_ratio=4.0, adaLN_modulation_img=None, adaLN_modulation_txt=None):
+    def __init__(
+        self,
+        hidden_size,
+        groups,
+        mlp_ratio=4.0,
+        adaLN_modulation_img=None,
+        adaLN_modulation_txt=None,
+        joint_prope_enabled=False,
+        prope_freq_base=100.0,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.groups = groups
@@ -221,7 +289,13 @@ class MMDiTBlockT2I(nn.Module):
         self.norm_x1 = RMSNorm(hidden_size, eps=1e-6)
         self.norm_y1 = RMSNorm(hidden_size, eps=1e-6)
 
-        self.attn = MMDiTJointAttention(hidden_size, num_heads=groups, qkv_bias=False)
+        self.attn = MMDiTJointAttention(
+            hidden_size,
+            num_heads=groups,
+            qkv_bias=False,
+            joint_prope_enabled=joint_prope_enabled,
+            prope_freq_base=prope_freq_base,
+        )
 
         self.norm_x2 = RMSNorm(hidden_size, eps=1e-6)
         self.norm_y2 = RMSNorm(hidden_size, eps=1e-6)
@@ -233,7 +307,19 @@ class MMDiTBlockT2I(nn.Module):
         self.adaLN_modulation_img = adaLN_modulation_img if adaLN_modulation_img is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.adaLN_modulation_txt = adaLN_modulation_txt if adaLN_modulation_txt is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
-    def forward(self, x, y, c, pos_img, pos_txt=None, attn_mask=None, num_views=1):
+    def forward(
+        self,
+        x,
+        y,
+        c,
+        pos_img,
+        pos_txt=None,
+        attn_mask=None,
+        num_views=1,
+        prope_w2cs=None,
+        prope_intrinsics=None,
+        patch_grid=None,
+    ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
         # exactly `c[::num_views]`. A no-op at num_views=1.
@@ -245,7 +331,17 @@ class MMDiTBlockT2I(nn.Module):
 
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
         y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
-        attn_x, attn_y = self.attn(x_norm, y_norm, pos_img, pos_txt, attn_mask, num_views)
+        attn_x, attn_y = self.attn(
+            x_norm,
+            y_norm,
+            pos_img,
+            pos_txt,
+            attn_mask,
+            num_views,
+            prope_w2cs=prope_w2cs,
+            prope_intrinsics=prope_intrinsics,
+            patch_grid=patch_grid,
+        )
         x = x + gate_msa_x * attn_x
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
         if not text_on:
@@ -280,6 +376,8 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        camera_pose_mode: str = "none",
+        prope_freq_base: float = 100.0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -299,6 +397,13 @@ class PixDiT_T2I(nn.Module):
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
+        self.camera_pose_mode = str(camera_pose_mode)
+        if self.camera_pose_mode not in ("none", "joint_prope"):
+            raise ValueError(
+                "camera_pose_mode must be none|joint_prope, "
+                f"got {self.camera_pose_mode!r}"
+            )
+        self.joint_prope_enabled = self.camera_pose_mode == "joint_prope"
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -317,6 +422,8 @@ class PixDiT_T2I(nn.Module):
                 self.num_groups,
                 adaLN_modulation_img=self._shared_cond_adaln_img,
                 adaLN_modulation_txt=self._shared_cond_adaln_txt,
+                joint_prope_enabled=self.joint_prope_enabled,
+                prope_freq_base=prope_freq_base,
             )
             for _ in range(self.patch_depth)
         ])
@@ -427,6 +534,52 @@ class PixDiT_T2I(nn.Module):
             )
         return geometry.to(device=device, dtype=dtype)
 
+    @staticmethod
+    def _prepare_prope_cameras(
+        w2cs: torch.Tensor,
+        intrinsics: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        device,
+    ):
+        if w2cs.dim() == 3:
+            w2cs = w2cs.unsqueeze(0)
+        if intrinsics.dim() == 3:
+            intrinsics = intrinsics.unsqueeze(0)
+        if w2cs.dim() != 4 or w2cs.shape[1:] != (num_views, 4, 4):
+            raise ValueError(
+                "PRoPE view matrices must be [B,V,4,4], "
+                f"got {tuple(w2cs.shape)}"
+            )
+        if (
+            intrinsics.dim() != 4
+            or intrinsics.shape[1:] != (num_views, 3, 3)
+        ):
+            raise ValueError(
+                "PRoPE intrinsics must be [B,V,3,3], "
+                f"got {tuple(intrinsics.shape)}"
+            )
+        if model_rows % num_views:
+            raise ValueError(
+                f"model rows {model_rows} are not divisible by num_views={num_views}"
+            )
+        model_batch = model_rows // num_views
+        if model_batch % w2cs.shape[0]:
+            raise ValueError(
+                f"PRoPE camera batch {w2cs.shape[0]} does not divide "
+                f"model batch {model_batch}"
+            )
+        if intrinsics.shape[0] != w2cs.shape[0]:
+            raise ValueError("PRoPE extrinsic and intrinsic batches disagree")
+        if w2cs.shape[0] != model_batch:
+            repeats = model_batch // w2cs.shape[0]
+            w2cs = w2cs.repeat(repeats, 1, 1, 1)
+            intrinsics = intrinsics.repeat(repeats, 1, 1, 1)
+        return (
+            w2cs.to(device=device, dtype=torch.float32),
+            intrinsics.to(device=device, dtype=torch.float32),
+        )
+
     def forward(
         self,
         x,
@@ -436,6 +589,8 @@ class PixDiT_T2I(nn.Module):
         mask=None,
         num_views=1,
         patch_geometry=None,
+        prope_w2cs=None,
+        prope_intrinsics=None,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -457,6 +612,20 @@ class PixDiT_T2I(nn.Module):
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
 
         text_on = y is not None
+        if self.joint_prope_enabled and text_on:
+            raise ValueError("joint PRoPE requires the text stream to be disabled")
+        if self.joint_prope_enabled:
+            if prope_w2cs is None or prope_intrinsics is None:
+                raise ValueError(
+                    "joint PRoPE requires prope_w2cs and prope_intrinsics"
+                )
+            prope_w2cs, prope_intrinsics = self._prepare_prope_cameras(
+                prope_w2cs,
+                prope_intrinsics,
+                B,
+                num_views,
+                x.device,
+            )
         y_emb, Ltxt, Btxt = None, 0, B // num_views
         if text_on:
             if y.dim() != 3:
@@ -503,7 +672,18 @@ class PixDiT_T2I(nn.Module):
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
+                s, y_emb = self.patch_blocks[i](
+                    s,
+                    y_emb,
+                    condition,
+                    pos,
+                    pos_txt,
+                    attn_mask_joint,
+                    num_views,
+                    prope_w2cs=prope_w2cs,
+                    prope_intrinsics=prope_intrinsics,
+                    patch_grid=(Hs, Ws),
+                )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
