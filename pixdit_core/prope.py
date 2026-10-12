@@ -125,25 +125,31 @@ class PropeDotProductAttention(nn.Module):
                 f"got {tuple(intrinsics.shape)}"
             )
         self.cameras = cameras
-        self.apply_fn_q, self.apply_fn_kv, self.apply_fn_o = _prepare_apply_fns(
-            head_dim=self.head_dim,
-            viewmats=viewmats,
-            intrinsics=intrinsics,
-            coeffs_x=(self.coeffs_x_0, self.coeffs_x_1),
-            coeffs_y=(self.coeffs_y_0, self.coeffs_y_1),
-        )
+        # Camera matrices and their inverses are numerically sensitive. Accelerate's outer bf16
+        # autocast otherwise downcasts these einsums despite callers passing float tensors.
+        with torch.autocast(device_type=viewmats.device.type, enabled=False):
+            self.apply_fn_q, self.apply_fn_kv, self.apply_fn_o = _prepare_apply_fns(
+                head_dim=self.head_dim,
+                viewmats=viewmats.float(),
+                intrinsics=intrinsics.float(),
+                coeffs_x=(self.coeffs_x_0.float(), self.coeffs_x_1.float()),
+                coeffs_y=(self.coeffs_y_0.float(), self.coeffs_y_1.float()),
+            )
 
     def apply_to_q(self, query: torch.Tensor) -> torch.Tensor:
         self._check_features(query, "query")
-        return self.apply_fn_q(query)
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            return self.apply_fn_q(query.float())
 
     def apply_to_kv(self, features: torch.Tensor) -> torch.Tensor:
         self._check_features(features, "key/value")
-        return self.apply_fn_kv(features)
+        with torch.autocast(device_type=features.device.type, enabled=False):
+            return self.apply_fn_kv(features.float())
 
     def apply_to_output(self, output: torch.Tensor) -> torch.Tensor:
         self._check_features(output, "output")
-        return self.apply_fn_o(output)
+        with torch.autocast(device_type=output.device.type, enabled=False):
+            return self.apply_fn_o(output.float())
 
     def _check_features(self, features: torch.Tensor, name: str) -> None:
         if self.apply_fn_q is None:
