@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 
 from typing import Tuple
 
@@ -333,6 +335,25 @@ class MMDiTJointAttention(nn.Module):
         module.update_coeffs(patch_width, patch_height, device)
         module.prepare(w2cs.float(), intrinsics.float())
 
+    @staticmethod
+    def _pose_biased_attention(query, key, value, score_bias):
+        """Run additive-bias attention through PyTorch's stable math backend.
+
+        On PyTorch 2.7, the CUDA efficient-attention backward fails for the
+        36x36 query grid with ``LSE is not correctly aligned (strideH)``.
+        Flash and cuDNN attention do not accept this arbitrary additive mask.
+        Activation checkpointing bounds the math backend's materialized score
+        memory to one block, so this remains practical at 576x576.
+        """
+        with sdpa_kernel(SDPBackend.MATH):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                dropout_p=0.0,
+                attn_mask=score_bias,
+            )
+
     def _joint_image_attention(
         self,
         qx,
@@ -364,6 +385,7 @@ class MMDiTJointAttention(nn.Module):
             )
         outputs = []
         for query_view in range(num_views):
+            query = q_views[:, :, query_view].contiguous()
             score_bias = None
             if self.camera_pose_mode == "epipolar_bias":
                 if pose_bias is None:
@@ -375,16 +397,12 @@ class MMDiTJointAttention(nn.Module):
             elif self.camera_pose_mode == "prope_side":
                 score_bias = torch.einsum(
                     "bhnd,bhmd->bhnm",
-                    pose_q_views[:, :, query_view],
+                    pose_q_views[:, :, query_view].contiguous(),
                     pose_k,
                 ) * (self.pose_side_dim ** -0.5)
             outputs.append(
-                F.scaled_dot_product_attention(
-                    q_views[:, :, query_view],
-                    kx,
-                    vx,
-                    dropout_p=0.0,
-                    attn_mask=score_bias,
+                self._pose_biased_attention(
+                    query, kx, vx, score_bias
                 )
             )
         return torch.stack(outputs, dim=2).reshape(
@@ -479,13 +497,18 @@ class MMDiTJointAttention(nn.Module):
                 pose_q_views[:, :, 0],
                 cross_pose_k,
             ) * (self.pose_side_dim ** -0.5)
-        cross_output = F.scaled_dot_product_attention(
-            q_views[:, :, 0],
-            cross_k,
-            cross_v,
-            dropout_p=0.0,
-            attn_mask=cross_bias,
-        )
+        cross_query = q_views[:, :, 0].contiguous()
+        if cross_bias is None:
+            cross_output = F.scaled_dot_product_attention(
+                cross_query,
+                cross_k,
+                cross_v,
+                dropout_p=0.0,
+            )
+        else:
+            cross_output = self._pose_biased_attention(
+                cross_query, cross_k, cross_v, cross_bias
+            )
         render_output = (
             base_output[:, :, 0]
             + torch.tanh(self.extra_ref_gate).view(1, heads, 1, 1)
@@ -1155,19 +1178,88 @@ class PixDiT_T2I(nn.Module):
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](
-                    s,
-                    y_emb,
-                    condition,
-                    pos,
-                    pos_txt,
-                    attn_mask_joint,
-                    num_views,
-                    prope_w2cs=prope_w2cs,
-                    prope_intrinsics=prope_intrinsics,
-                    patch_grid=(Hs, Ws),
-                    pose_bias=pose_bias,
+                block = self.patch_blocks[i]
+                checkpoint_block = (
+                    self.training
+                    and getattr(self, "grad_checkpointing", False)
+                    and i % max(
+                        1, int(getattr(self, "grad_checkpointing_step", 1))
+                    )
+                    == 0
                 )
+                if checkpoint_block and y_emb is None:
+                    # Keep the optional text stream out of checkpoint's tensor
+                    # arguments. The closure returns only the image tokens, so
+                    # a no-text restoration run can use activation
+                    # checkpointing without manufacturing a dummy tensor.
+                    def patch_forward(
+                        s_input,
+                        condition_input,
+                        block=block,
+                    ):
+                        s_output, _ = block(
+                            s_input,
+                            None,
+                            condition_input,
+                            pos,
+                            pos_txt,
+                            attn_mask_joint,
+                            num_views,
+                            prope_w2cs=prope_w2cs,
+                            prope_intrinsics=prope_intrinsics,
+                            patch_grid=(Hs, Ws),
+                            pose_bias=pose_bias,
+                        )
+                        return s_output
+
+                    s = checkpoint(
+                        patch_forward,
+                        s,
+                        condition,
+                        use_reentrant=False,
+                    )
+                elif checkpoint_block:
+                    def patch_forward(
+                        s_input,
+                        y_input,
+                        condition_input,
+                        block=block,
+                    ):
+                        return block(
+                            s_input,
+                            y_input,
+                            condition_input,
+                            pos,
+                            pos_txt,
+                            attn_mask_joint,
+                            num_views,
+                            prope_w2cs=prope_w2cs,
+                            prope_intrinsics=prope_intrinsics,
+                            patch_grid=(Hs, Ws),
+                            pose_bias=pose_bias,
+                        )
+
+                    s, y_emb = checkpoint(
+                        patch_forward,
+                        s,
+                        y_emb,
+                        condition,
+                        use_reentrant=False,
+                    )
+                else:
+                    s, y_emb = block(
+                        s,
+                        y_emb,
+                        condition,
+                        pos,
+                        pos_txt,
+                        attn_mask_joint,
+                        num_views,
+                        prope_w2cs=prope_w2cs,
+                        prope_intrinsics=prope_intrinsics,
+                        patch_grid=(Hs, Ws),
+                        pose_bias=pose_bias,
+                    )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
@@ -1185,8 +1277,40 @@ class PixDiT_T2I(nn.Module):
 
         s_cond = s.view(B * L, self.hidden_size)
         x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
-        for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+        for i, blk in enumerate(self.pixel_blocks):
+            checkpoint_block = (
+                self.training
+                and getattr(self, "grad_checkpointing", False)
+                and i % max(
+                    1, int(getattr(self, "grad_checkpointing_step", 1))
+                )
+                == 0
+            )
+            if checkpoint_block:
+                def pixel_forward(
+                    x_input,
+                    condition_input,
+                    block=blk,
+                ):
+                    return block(
+                        x_input,
+                        condition_input,
+                        H,
+                        W,
+                        self.patch_size,
+                        mask,
+                    )
+
+                x_pixels = checkpoint(
+                    pixel_forward,
+                    x_pixels,
+                    s_cond,
+                    use_reentrant=False,
+                )
+            else:
+                x_pixels = blk(
+                    x_pixels, s_cond, H, W, self.patch_size, mask
+                )
 
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels
