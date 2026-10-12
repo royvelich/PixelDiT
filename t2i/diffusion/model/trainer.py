@@ -83,6 +83,11 @@ class PixDiTTrainer(nn.Module):
         if restore_cfg is not None:
             camera_pose_kwargs = {
                 "camera_pose_mode": restore_cfg.camera_pose_mode,
+                "multi_ref_attention_mode": restore_cfg.multi_ref_attention_mode,
+                "pose_shuffle": restore_cfg.pose_shuffle,
+                "pose_bias_margin": restore_cfg.pose_bias_margin,
+                "pose_bias_clip": restore_cfg.pose_bias_clip,
+                "pose_side_dim": restore_cfg.pose_side_dim,
                 "prope_freq_base": restore_cfg.prope_freq_base,
             }
 

@@ -14,7 +14,7 @@ from .modules import (
     apply_rotary_emb,
     precompute_freqs_cis_2d,
 )
-from .prope import PropeDotProductAttention
+from .prope import PropeDotProductAttention, invert_se3
 
 
 def merge_views(t: torch.Tensor, num_views: int) -> torch.Tensor:
@@ -54,6 +54,122 @@ def split_views(t: torch.Tensor, num_views: int, tokens_per_view: int) -> torch.
         .permute(0, 2, 1, 3, 4)
         .reshape(B * num_views, H, tokens_per_view, D)
     )
+
+
+def build_epipolar_attention_bias(
+    w2cs: torch.Tensor,
+    intrinsics: torch.Tensor,
+    patch_grid,
+    margin_patches: float,
+    clip_value: float,
+) -> torch.Tensor:
+    """Return a depth-free cross-view score bias in ``[B,V,N,V*N]`` layout.
+
+    The cameras use PRoPE's normalized image convention: both image axes cover
+    approximately ``[-0.5, 0.5]`` and intrinsics include the shared resize/crop.
+    Same-view entries stay zero so ordinary pretrained 2D-RoPE self-attention is
+    untouched. Cross-view entries are the negative robust distance from a key
+    patch centre to the query patch's epipolar line.
+    """
+    if patch_grid is None or len(patch_grid) != 2:
+        raise ValueError("epipolar attention requires a (height, width) patch grid")
+    patch_height, patch_width = (int(value) for value in patch_grid)
+    if patch_height <= 0 or patch_width <= 0:
+        raise ValueError(f"invalid epipolar patch grid {patch_grid}")
+    if w2cs.dim() != 4 or w2cs.shape[-2:] != (4, 4):
+        raise ValueError(f"w2cs must be [B,V,4,4], got {tuple(w2cs.shape)}")
+    if intrinsics.shape != w2cs.shape[:2] + (3, 3):
+        raise ValueError(
+            "intrinsics must match w2cs as [B,V,3,3], "
+            f"got {tuple(intrinsics.shape)}"
+        )
+
+    device = w2cs.device
+    batch, views = w2cs.shape[:2]
+    tokens = patch_height * patch_width
+    with torch.autocast(device_type=device.type, enabled=False):
+        xs = (
+            (torch.arange(patch_width, device=device, dtype=torch.float32) + 0.5)
+            / patch_width
+            - 0.5
+        )
+        ys = (
+            (torch.arange(patch_height, device=device, dtype=torch.float32) + 0.5)
+            / patch_height
+            - 0.5
+        )
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        patch_points = torch.stack(
+            (
+                grid_x.reshape(-1),
+                grid_y.reshape(-1),
+                torch.ones(tokens, device=device, dtype=torch.float32),
+            ),
+            dim=-1,
+        )
+
+        w2cs = w2cs.float()
+        intrinsics = intrinsics.float()
+        c2ws = invert_se3(w2cs)
+        inverse_intrinsics = torch.linalg.inv(intrinsics)
+        patch_scale = 0.5 * (
+            1.0 / float(patch_width) + 1.0 / float(patch_height)
+        )
+        output = torch.zeros(
+            batch,
+            views,
+            tokens,
+            views * tokens,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        for query_view in range(views):
+            for key_view in range(views):
+                if query_view == key_view:
+                    continue
+                relative = w2cs[:, key_view] @ c2ws[:, query_view]
+                rotation = relative[:, :3, :3]
+                translation = relative[:, :3, 3]
+                tx, ty, tz = translation.unbind(dim=-1)
+                skew = torch.zeros(
+                    batch, 3, 3, device=device, dtype=torch.float32
+                )
+                skew[:, 0, 1] = -tz
+                skew[:, 0, 2] = ty
+                skew[:, 1, 0] = tz
+                skew[:, 1, 2] = -tx
+                skew[:, 2, 0] = -ty
+                skew[:, 2, 1] = tx
+                fundamental = (
+                    inverse_intrinsics[:, key_view].transpose(-1, -2)
+                    @ skew
+                    @ rotation
+                    @ inverse_intrinsics[:, query_view]
+                )
+                lines = torch.einsum(
+                    "bij,nj->bni", fundamental, patch_points
+                )
+                numerator = torch.einsum(
+                    "bni,mi->bnm", lines, patch_points
+                ).abs()
+                denominator = torch.linalg.vector_norm(
+                    lines[..., :2], dim=-1
+                ).clamp_min(1e-8)
+                distance_patches = (
+                    numerator / denominator.unsqueeze(-1) / patch_scale
+                )
+                excess = F.relu(distance_patches - float(margin_patches))
+                penalty = torch.sqrt(1.0 + excess.square()) - 1.0
+                penalty = penalty.clamp_max(float(clip_value))
+                valid_baseline = (
+                    torch.linalg.vector_norm(translation, dim=-1) > 1e-7
+                ).view(batch, 1, 1)
+                start = key_view * tokens
+                output[
+                    :, query_view, :, start : start + tokens
+                ] = -penalty * valid_baseline
+    return output
 
 
 class PatchGeometryEmbedder(nn.Module):
@@ -106,166 +222,465 @@ class PatchGeometryEmbedder(nn.Module):
 
 class MMDiTJointAttention(nn.Module):
     def __init__(
-            self,
-            dim: int,
-            num_heads: int = 8,
-            qkv_bias: bool = False,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
-            joint_prope_enabled: bool = False,
-            prope_freq_base: float = 100.0,
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        camera_pose_mode: str = "none",
+        multi_ref_attention_mode: str = "joint",
+        pose_side_dim: int = 16,
+        prope_freq_base: float = 100.0,
     ) -> None:
         super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.dim // self.num_heads
+        self.camera_pose_mode = str(camera_pose_mode)
+        self.multi_ref_attention_mode = str(multi_ref_attention_mode)
+        self.pose_side_dim = int(pose_side_dim)
+        if self.camera_pose_mode not in (
+            "none",
+            "joint_prope",
+            "epipolar_bias",
+            "prope_side",
+        ):
+            raise ValueError(f"unsupported camera pose mode {self.camera_pose_mode!r}")
+        if self.multi_ref_attention_mode not in ("joint", "rank0_residual"):
+            raise ValueError(
+                "multi_ref_attention_mode must be joint|rank0_residual"
+            )
 
-        self.qkv_x = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.qkv_y = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv_x = nn.Linear(self.dim, self.dim * 3, bias=qkv_bias)
+        self.qkv_y = nn.Linear(self.dim, self.dim * 3, bias=qkv_bias)
 
         self.q_norm_x = RMSNorm(self.head_dim)
         self.k_norm_x = RMSNorm(self.head_dim)
         self.q_norm_y = RMSNorm(self.head_dim)
         self.k_norm_y = RMSNorm(self.head_dim)
 
-        self.proj_x = nn.Linear(dim, dim)
-        self.proj_y = nn.Linear(dim, dim)
+        self.proj_x = nn.Linear(self.dim, self.dim)
+        self.proj_y = nn.Linear(self.dim, self.dim)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop_x = nn.Dropout(proj_drop)
         self.proj_drop_y = nn.Dropout(proj_drop)
-        self.joint_prope = (
-            PropeDotProductAttention(
+
+        self.joint_prope = None
+        if self.camera_pose_mode == "joint_prope":
+            self.joint_prope = PropeDotProductAttention(
                 self.head_dim,
                 freq_base=prope_freq_base,
             )
-            if joint_prope_enabled
-            else None
+
+        self.pose_gate = None
+        if self.camera_pose_mode == "epipolar_bias":
+            initial_pose_gate = (
+                1.0
+                if self.multi_ref_attention_mode == "rank0_residual"
+                else 0.0
+            )
+            self.pose_gate = nn.Parameter(
+                torch.full((self.num_heads,), initial_pose_gate)
+            )
+
+        self.pose_q = self.pose_k = self.pose_side_prope = None
+        if self.camera_pose_mode == "prope_side":
+            if self.pose_side_dim < 4 or self.pose_side_dim % 4:
+                raise ValueError("pose_side_dim must be >= 4 and divisible by 4")
+            side_width = self.num_heads * self.pose_side_dim
+            self.pose_q = nn.Linear(self.dim, side_width, bias=False)
+            self.pose_k = nn.Linear(self.dim, side_width, bias=False)
+            nn.init.zeros_(self.pose_q.weight)
+            nn.init.normal_(self.pose_k.weight, std=0.02)
+            self.pose_side_prope = PropeDotProductAttention(
+                self.pose_side_dim,
+                freq_base=prope_freq_base,
+            )
+
+        self.extra_ref_gate = None
+        if self.multi_ref_attention_mode == "rank0_residual":
+            self.extra_ref_gate = nn.Parameter(torch.zeros(self.num_heads))
+
+    @staticmethod
+    def _validate_pose_inputs(
+        prope_w2cs,
+        prope_intrinsics,
+        batch,
+        num_views,
+        patch_grid,
+    ):
+        if prope_w2cs is None or prope_intrinsics is None:
+            raise ValueError("camera pose attention requires cameras and intrinsics")
+        if patch_grid is None or len(patch_grid) != 2:
+            raise ValueError("camera pose attention requires a patch grid")
+        if prope_w2cs.shape != (batch, num_views, 4, 4):
+            raise ValueError(
+                "camera matrices must be "
+                f"{(batch, num_views, 4, 4)}, got {tuple(prope_w2cs.shape)}"
+            )
+        if prope_intrinsics.shape != (batch, num_views, 3, 3):
+            raise ValueError(
+                "camera intrinsics must be "
+                f"{(batch, num_views, 3, 3)}, "
+                f"got {tuple(prope_intrinsics.shape)}"
+            )
+
+    @staticmethod
+    def _prepare_prope(module, w2cs, intrinsics, patch_grid, device):
+        patch_height, patch_width = (int(value) for value in patch_grid)
+        module.update_coeffs(patch_width, patch_height, device)
+        module.prepare(w2cs.float(), intrinsics.float())
+
+    def _joint_image_attention(
+        self,
+        qx,
+        kx,
+        vx,
+        num_views,
+        tokens_per_view,
+        pose_bias=None,
+        pose_q=None,
+        pose_k=None,
+    ):
+        if self.camera_pose_mode not in ("epipolar_bias", "prope_side"):
+            return F.scaled_dot_product_attention(
+                qx, kx, vx, dropout_p=0.0
+            )
+
+        batch, heads, _, width = qx.shape
+        q_views = qx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+        pose_q_views = None
+        if pose_q is not None:
+            pose_q_views = pose_q.view(
+                batch,
+                heads,
+                num_views,
+                tokens_per_view,
+                self.pose_side_dim,
+            )
+        outputs = []
+        for query_view in range(num_views):
+            score_bias = None
+            if self.camera_pose_mode == "epipolar_bias":
+                if pose_bias is None:
+                    raise ValueError("epipolar attention requires pose_bias")
+                score_bias = (
+                    pose_bias[:, query_view].unsqueeze(1)
+                    * self.pose_gate.view(1, heads, 1, 1)
+                ).to(qx.dtype)
+            elif self.camera_pose_mode == "prope_side":
+                score_bias = torch.einsum(
+                    "bhnd,bhmd->bhnm",
+                    pose_q_views[:, :, query_view],
+                    pose_k,
+                ) * (self.pose_side_dim ** -0.5)
+            outputs.append(
+                F.scaled_dot_product_attention(
+                    q_views[:, :, query_view],
+                    kx,
+                    vx,
+                    dropout_p=0.0,
+                    attn_mask=score_bias,
+                )
+            )
+        return torch.stack(outputs, dim=2).reshape(
+            batch, heads, num_views * tokens_per_view, width
+        )
+
+    def _rank0_residual_attention(
+        self,
+        qx,
+        kx,
+        vx,
+        num_views,
+        tokens_per_view,
+        pose_bias=None,
+        pose_q=None,
+        pose_k=None,
+    ):
+        if num_views < 3:
+            raise ValueError(
+                "rank0_residual needs render, rank0, and at least one extra ref"
+            )
+        batch, heads, _, width = qx.shape
+        q_views = qx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+        k_views = kx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+        v_views = vx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+
+        base_q = q_views[:, :, :2].reshape(
+            batch, heads, 2 * tokens_per_view, width
+        )
+        base_k = k_views[:, :, :2].reshape_as(base_q)
+        base_v = v_views[:, :, :2].reshape_as(base_q)
+        base_output = F.scaled_dot_product_attention(
+            base_q, base_k, base_v, dropout_p=0.0
+        ).view(batch, heads, 2, tokens_per_view, width)
+
+        extra_views = num_views - 2
+        extra_q = q_views[:, :, 2:].permute(0, 2, 1, 3, 4).reshape(
+            batch * extra_views, heads, tokens_per_view, width
+        )
+        extra_k = k_views[:, :, 2:].permute(0, 2, 1, 3, 4).reshape_as(
+            extra_q
+        )
+        extra_v = v_views[:, :, 2:].permute(0, 2, 1, 3, 4).reshape_as(
+            extra_q
+        )
+        extra_output = F.scaled_dot_product_attention(
+            extra_q, extra_k, extra_v, dropout_p=0.0
+        ).view(
+            batch, extra_views, heads, tokens_per_view, width
+        ).permute(0, 2, 1, 3, 4)
+
+        cross_k = k_views[:, :, 2:].reshape(
+            batch, heads, extra_views * tokens_per_view, width
+        )
+        cross_v = v_views[:, :, 2:].reshape_as(cross_k)
+        cross_bias = None
+        if self.camera_pose_mode == "epipolar_bias":
+            if pose_bias is None:
+                raise ValueError("epipolar attention requires pose_bias")
+            cross_bias = (
+                pose_bias[:, 0, :, 2 * tokens_per_view :].unsqueeze(1)
+                * self.pose_gate.view(1, heads, 1, 1)
+            ).to(qx.dtype)
+        elif self.camera_pose_mode == "prope_side":
+            pose_q_views = pose_q.view(
+                batch,
+                heads,
+                num_views,
+                tokens_per_view,
+                self.pose_side_dim,
+            )
+            cross_pose_k = pose_k.view(
+                batch,
+                heads,
+                num_views,
+                tokens_per_view,
+                self.pose_side_dim,
+            )[:, :, 2:].reshape(
+                batch,
+                heads,
+                extra_views * tokens_per_view,
+                self.pose_side_dim,
+            )
+            cross_bias = torch.einsum(
+                "bhnd,bhmd->bhnm",
+                pose_q_views[:, :, 0],
+                cross_pose_k,
+            ) * (self.pose_side_dim ** -0.5)
+        cross_output = F.scaled_dot_product_attention(
+            q_views[:, :, 0],
+            cross_k,
+            cross_v,
+            dropout_p=0.0,
+            attn_mask=cross_bias,
+        )
+        render_output = (
+            base_output[:, :, 0]
+            + torch.tanh(self.extra_ref_gate).view(1, heads, 1, 1)
+            * cross_output
+        )
+        output_views = torch.cat(
+            (
+                render_output.unsqueeze(2),
+                base_output[:, :, 1:],
+                extra_output,
+            ),
+            dim=2,
+        )
+        return output_views.reshape(
+            batch, heads, num_views * tokens_per_view, width
         )
 
     def forward(
-            self,
-            x: torch.Tensor,
-            y: torch.Tensor,
-            pos_img: torch.Tensor,
-            pos_txt: torch.Tensor = None,
-            attn_mask: torch.Tensor = None,
-            num_views: int = 1,
-            prope_w2cs: torch.Tensor = None,
-            prope_intrinsics: torch.Tensor = None,
-            patch_grid=None,
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        pos_img: torch.Tensor,
+        pos_txt: torch.Tensor = None,
+        attn_mask: torch.Tensor = None,
+        num_views: int = 1,
+        prope_w2cs: torch.Tensor = None,
+        prope_intrinsics: torch.Tensor = None,
+        patch_grid=None,
+        pose_bias: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # y is None when the text stream is disabled: the attention then runs single-stream over
-        # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
-        # no text weight is touched and none of its compute is paid.
-        #
-        # With text present: image tokens arrive at B*V (one row per view) while the TEXT stream
-        # stays at B, shared across a sample's views. Merging text as well would duplicate it V
-        # times and let the copies diverge, so only the image slice joins the cross-view token axis.
-        B, Nx, C = x.shape
+        # Image rows are b-major [render, ref0, ref1, ...]. New pose modes are
+        # deliberately image-only so their score layouts cannot silently collide
+        # with the shared text token stream.
+        model_rows, tokens_per_view, channels = x.shape
         text_on = y is not None
-        By = B // num_views
+        sample_batch = model_rows // num_views
         if text_on:
-            By, Ny, Cy = y.shape
-            assert C == Cy, "x and y must share the channel dim"
-            assert B == By * num_views, (
-                f"image batch {B} must be text batch {By} * num_views {num_views}"
+            sample_batch, text_tokens, text_channels = y.shape
+            assert channels == text_channels
+            assert model_rows == sample_batch * num_views
+        if (
+            text_on
+            and (
+                self.camera_pose_mode != "none"
+                or self.multi_ref_attention_mode != "joint"
             )
+        ):
+            raise ValueError("pose and rank0-residual attention require no text")
 
-        qkv_x = self.qkv_x(x).reshape(B, Nx, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
+        qkv_x = self.qkv_x(x).reshape(
+            model_rows,
+            tokens_per_view,
+            3,
+            self.num_heads,
+            self.head_dim,
+        ).permute(2, 0, 1, 3, 4)
         qx, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
         qx = self.q_norm_x(qx)
         kx = self.k_norm_x(kx)
 
-        # Note the batch: image tokens are at B (== B*V), text at By. Using B here would be a
-        # shape error at V>1 and a silent no-op at V=1.
+        pose_q = pose_k = None
+        if self.camera_pose_mode == "prope_side":
+            pose_q = self.pose_q(x).reshape(
+                model_rows,
+                tokens_per_view,
+                self.num_heads,
+                self.pose_side_dim,
+            ).transpose(1, 2)
+            pose_k = self.pose_k(x).reshape(
+                model_rows,
+                tokens_per_view,
+                self.num_heads,
+                self.pose_side_dim,
+            ).transpose(1, 2)
+
         if text_on:
-            qkv_y = self.qkv_y(y).reshape(By, Ny, 3, self.num_heads, C // self.num_heads).permute(2, 0, 1, 3, 4)
+            qkv_y = self.qkv_y(y).reshape(
+                sample_batch,
+                text_tokens,
+                3,
+                self.num_heads,
+                self.head_dim,
+            ).permute(2, 0, 1, 3, 4)
             qy, ky, vy = qkv_y[0], qkv_y[1], qkv_y[2]
             qy = self.q_norm_y(qy)
             ky = self.k_norm_y(ky)
 
+        # The safe modes always retain the pretrained 2D RoPE. Only the
+        # historical joint_prope control takes the old destructive switch.
         if self.joint_prope is None:
             qx, kx = apply_rotary_emb(qx, kx, freqs_cis=pos_img)
-        elif text_on:
-            raise ValueError(
-                "joint PRoPE is image-only; disable the text stream"
-            )
         if text_on and pos_txt is not None:
             qy, ky = apply_rotary_emb(qy, ky, freqs_cis=pos_txt)
 
-        qx = qx.transpose(1, 2)
-        kx = kx.transpose(1, 2)
-        vx = vx.transpose(1, 2)
+        qx = merge_views(qx.transpose(1, 2), num_views)
+        kx = merge_views(kx.transpose(1, 2), num_views)
+        vx = merge_views(vx.transpose(1, 2), num_views)
+        if pose_q is not None:
+            pose_q = merge_views(pose_q, num_views)
+            pose_k = merge_views(pose_k, num_views)
 
-        if text_on:
-            qy = qy.transpose(1, 2)
-            ky = ky.transpose(1, 2)
-            vy = vy.transpose(1, 2)
-
-        # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so each view must get
-        # the same positional phase. Merging first would be identical here, but doing it last
-        # keeps the invariant obvious.
-        qx = merge_views(qx, num_views)
-        kx = merge_views(kx, num_views)
-        vx = merge_views(vx, num_views)
-
-        if self.joint_prope is not None:
-            if prope_w2cs is None or prope_intrinsics is None:
-                raise ValueError(
-                    "joint PRoPE requires camera extrinsics and intrinsics"
-                )
-            if patch_grid is None or len(patch_grid) != 2:
-                raise ValueError("joint PRoPE requires a (height, width) patch grid")
-            patch_height, patch_width = (int(v) for v in patch_grid)
-            expected_batch = B // num_views
-            if prope_w2cs.shape != (expected_batch, num_views, 4, 4):
-                raise ValueError(
-                    "joint PRoPE view matrices must be "
-                    f"{(expected_batch, num_views, 4, 4)}, "
-                    f"got {tuple(prope_w2cs.shape)}"
-                )
-            if prope_intrinsics.shape != (expected_batch, num_views, 3, 3):
-                raise ValueError(
-                    "joint PRoPE intrinsics must be "
-                    f"{(expected_batch, num_views, 3, 3)}, "
-                    f"got {tuple(prope_intrinsics.shape)}"
-                )
-            self.joint_prope.update_coeffs(
-                patch_width,
-                patch_height,
-                qx.device,
+        if self.camera_pose_mode != "none":
+            self._validate_pose_inputs(
+                prope_w2cs,
+                prope_intrinsics,
+                sample_batch,
+                num_views,
+                patch_grid,
             )
-            self.joint_prope.prepare(
-                prope_w2cs.float(),
-                prope_intrinsics.float(),
+        if self.joint_prope is not None:
+            self._prepare_prope(
+                self.joint_prope,
+                prope_w2cs,
+                prope_intrinsics,
+                patch_grid,
+                qx.device,
             )
             query_dtype = qx.dtype
             qx = self.joint_prope.apply_to_q(qx.float()).to(query_dtype)
             kx = self.joint_prope.apply_to_kv(kx.float()).to(query_dtype)
             vx = self.joint_prope.apply_to_kv(vx.float()).to(query_dtype)
+        elif self.pose_side_prope is not None:
+            self._prepare_prope(
+                self.pose_side_prope,
+                prope_w2cs,
+                prope_intrinsics,
+                patch_grid,
+                qx.device,
+            )
+            side_dtype = pose_q.dtype
+            pose_q = self.pose_side_prope.apply_to_q(
+                pose_q.float()
+            ).to(side_dtype)
+            pose_k = self.pose_side_prope.apply_to_kv(
+                pose_k.float()
+            ).to(side_dtype)
 
         if text_on:
+            qy = qy.transpose(1, 2)
+            ky = ky.transpose(1, 2)
+            vy = vy.transpose(1, 2)
             q_joint = torch.cat([qy, qx], dim=2)
             k_joint = torch.cat([ky, kx], dim=2)
             v_joint = torch.cat([vy, vx], dim=2)
+            out_joint = F.scaled_dot_product_attention(
+                q_joint,
+                k_joint,
+                v_joint,
+                dropout_p=0.0,
+                attn_mask=attn_mask,
+            )
+            image_output = out_joint[:, :, text_tokens:]
+        elif self.multi_ref_attention_mode == "rank0_residual":
+            image_output = self._rank0_residual_attention(
+                qx,
+                kx,
+                vx,
+                num_views,
+                tokens_per_view,
+                pose_bias=pose_bias,
+                pose_q=pose_q,
+                pose_k=pose_k,
+            )
+            out_joint = image_output
         else:
-            q_joint, k_joint, v_joint = qx, kx, vx
+            image_output = self._joint_image_attention(
+                qx,
+                kx,
+                vx,
+                num_views,
+                tokens_per_view,
+                pose_bias=pose_bias,
+                pose_q=pose_q,
+                pose_k=pose_k,
+            )
+            out_joint = image_output
 
-        out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
         if self.joint_prope is not None:
-            output_dtype = out_joint.dtype
-            out_joint = self.joint_prope.apply_to_output(
-                out_joint.float()
+            output_dtype = image_output.dtype
+            image_output = self.joint_prope.apply_to_output(
+                image_output.float()
             ).to(output_dtype)
-        n_txt = Ny if text_on else 0
-        out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
-        out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
-        out_x = self.proj_drop_x(self.proj_x(out_x))
 
+        out_x = split_views(
+            image_output, num_views, tokens_per_view
+        ).transpose(1, 2).reshape(
+            model_rows, tokens_per_view, channels
+        )
+        out_x = self.proj_drop_x(self.proj_x(out_x))
         if not text_on:
             return out_x, None
-        out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(By, Ny, C)
+
+        out_y = out_joint[:, :, :text_tokens].transpose(1, 2).reshape(
+            sample_batch, text_tokens, channels
+        )
         out_y = self.proj_drop_y(self.proj_y(out_y))
         return out_x, out_y
 
@@ -278,7 +693,9 @@ class MMDiTBlockT2I(nn.Module):
         mlp_ratio=4.0,
         adaLN_modulation_img=None,
         adaLN_modulation_txt=None,
-        joint_prope_enabled=False,
+        camera_pose_mode="none",
+        multi_ref_attention_mode="joint",
+        pose_side_dim=16,
         prope_freq_base=100.0,
     ):
         super().__init__()
@@ -293,7 +710,9 @@ class MMDiTBlockT2I(nn.Module):
             hidden_size,
             num_heads=groups,
             qkv_bias=False,
-            joint_prope_enabled=joint_prope_enabled,
+            camera_pose_mode=camera_pose_mode,
+            multi_ref_attention_mode=multi_ref_attention_mode,
+            pose_side_dim=pose_side_dim,
             prope_freq_base=prope_freq_base,
         )
 
@@ -319,6 +738,7 @@ class MMDiTBlockT2I(nn.Module):
         prope_w2cs=None,
         prope_intrinsics=None,
         patch_grid=None,
+        pose_bias=None,
     ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
@@ -341,6 +761,7 @@ class MMDiTBlockT2I(nn.Module):
             prope_w2cs=prope_w2cs,
             prope_intrinsics=prope_intrinsics,
             patch_grid=patch_grid,
+            pose_bias=pose_bias,
         )
         x = x + gate_msa_x * attn_x
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
@@ -377,6 +798,11 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
         camera_pose_mode: str = "none",
+        multi_ref_attention_mode: str = "joint",
+        pose_shuffle: bool = False,
+        pose_bias_margin: float = 1.5,
+        pose_bias_clip: float = 16.0,
+        pose_side_dim: int = 16,
         prope_freq_base: float = 100.0,
     ):
         super().__init__()
@@ -398,12 +824,28 @@ class PixDiT_T2I(nn.Module):
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.camera_pose_mode = str(camera_pose_mode)
-        if self.camera_pose_mode not in ("none", "joint_prope"):
+        if self.camera_pose_mode not in (
+            "none",
+            "joint_prope",
+            "epipolar_bias",
+            "prope_side",
+        ):
             raise ValueError(
-                "camera_pose_mode must be none|joint_prope, "
+                "camera_pose_mode must be "
+                "none|joint_prope|epipolar_bias|prope_side, "
                 f"got {self.camera_pose_mode!r}"
             )
+        self.multi_ref_attention_mode = str(multi_ref_attention_mode)
+        if self.multi_ref_attention_mode not in ("joint", "rank0_residual"):
+            raise ValueError(
+                "multi_ref_attention_mode must be joint|rank0_residual"
+            )
+        self.pose_shuffle = bool(pose_shuffle)
+        self.pose_bias_margin = float(pose_bias_margin)
+        self.pose_bias_clip = float(pose_bias_clip)
+        self.pose_side_dim = int(pose_side_dim)
         self.joint_prope_enabled = self.camera_pose_mode == "joint_prope"
+        self.camera_pose_enabled = self.camera_pose_mode != "none"
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -422,7 +864,9 @@ class PixDiT_T2I(nn.Module):
                 self.num_groups,
                 adaLN_modulation_img=self._shared_cond_adaln_img,
                 adaLN_modulation_txt=self._shared_cond_adaln_txt,
-                joint_prope_enabled=self.joint_prope_enabled,
+                camera_pose_mode=self.camera_pose_mode,
+                multi_ref_attention_mode=self.multi_ref_attention_mode,
+                pose_side_dim=self.pose_side_dim,
                 prope_freq_base=prope_freq_base,
             )
             for _ in range(self.patch_depth)
@@ -535,12 +979,13 @@ class PixDiT_T2I(nn.Module):
         return geometry.to(device=device, dtype=dtype)
 
     @staticmethod
-    def _prepare_prope_cameras(
+    def _prepare_pose_cameras(
         w2cs: torch.Tensor,
         intrinsics: torch.Tensor,
         model_rows: int,
         num_views: int,
         device,
+        shuffle_references: bool = False,
     ):
         if w2cs.dim() == 3:
             w2cs = w2cs.unsqueeze(0)
@@ -548,7 +993,7 @@ class PixDiT_T2I(nn.Module):
             intrinsics = intrinsics.unsqueeze(0)
         if w2cs.dim() != 4 or w2cs.shape[1:] != (num_views, 4, 4):
             raise ValueError(
-                "PRoPE view matrices must be [B,V,4,4], "
+                "camera view matrices must be [B,V,4,4], "
                 f"got {tuple(w2cs.shape)}"
             )
         if (
@@ -556,7 +1001,7 @@ class PixDiT_T2I(nn.Module):
             or intrinsics.shape[1:] != (num_views, 3, 3)
         ):
             raise ValueError(
-                "PRoPE intrinsics must be [B,V,3,3], "
+                "camera intrinsics must be [B,V,3,3], "
                 f"got {tuple(intrinsics.shape)}"
             )
         if model_rows % num_views:
@@ -566,7 +1011,7 @@ class PixDiT_T2I(nn.Module):
         model_batch = model_rows // num_views
         if model_batch % w2cs.shape[0]:
             raise ValueError(
-                f"PRoPE camera batch {w2cs.shape[0]} does not divide "
+                f"camera batch {w2cs.shape[0]} does not divide "
                 f"model batch {model_batch}"
             )
         if intrinsics.shape[0] != w2cs.shape[0]:
@@ -575,6 +1020,24 @@ class PixDiT_T2I(nn.Module):
             repeats = model_batch // w2cs.shape[0]
             w2cs = w2cs.repeat(repeats, 1, 1, 1)
             intrinsics = intrinsics.repeat(repeats, 1, 1, 1)
+        if shuffle_references:
+            if num_views < 3:
+                raise ValueError(
+                    "reference-pose shuffle requires at least two references"
+                )
+            # Keep the render camera fixed and cyclically attach every reference
+            # image to a different reference camera. Deterministic in training
+            # and validation, so this is a reproducible causality control.
+            w2cs = torch.cat(
+                (w2cs[:, :1], torch.roll(w2cs[:, 1:], 1, dims=1)), dim=1
+            )
+            intrinsics = torch.cat(
+                (
+                    intrinsics[:, :1],
+                    torch.roll(intrinsics[:, 1:], 1, dims=1),
+                ),
+                dim=1,
+            )
         return (
             w2cs.to(device=device, dtype=torch.float32),
             intrinsics.to(device=device, dtype=torch.float32),
@@ -612,20 +1075,40 @@ class PixDiT_T2I(nn.Module):
         t_emb = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
 
         text_on = y is not None
-        if self.joint_prope_enabled and text_on:
-            raise ValueError("joint PRoPE requires the text stream to be disabled")
-        if self.joint_prope_enabled:
+        if (
+            text_on
+            and (
+                self.camera_pose_enabled
+                or self.multi_ref_attention_mode != "joint"
+            )
+        ):
+            raise ValueError(
+                "pose and rank0-residual attention require the text stream "
+                "to be disabled"
+            )
+        pose_bias = None
+        if self.camera_pose_enabled:
             if prope_w2cs is None or prope_intrinsics is None:
                 raise ValueError(
-                    "joint PRoPE requires prope_w2cs and prope_intrinsics"
+                    "camera pose attention requires prope_w2cs and "
+                    "prope_intrinsics"
                 )
-            prope_w2cs, prope_intrinsics = self._prepare_prope_cameras(
+            prope_w2cs, prope_intrinsics = self._prepare_pose_cameras(
                 prope_w2cs,
                 prope_intrinsics,
                 B,
                 num_views,
                 x.device,
+                shuffle_references=self.pose_shuffle,
             )
+            if self.camera_pose_mode == "epipolar_bias":
+                pose_bias = build_epipolar_attention_bias(
+                    prope_w2cs,
+                    prope_intrinsics,
+                    (Hs, Ws),
+                    self.pose_bias_margin,
+                    self.pose_bias_clip,
+                )
         y_emb, Ltxt, Btxt = None, 0, B // num_views
         if text_on:
             if y.dim() != 3:
@@ -683,6 +1166,7 @@ class PixDiT_T2I(nn.Module):
                     prope_w2cs=prope_w2cs,
                     prope_intrinsics=prope_intrinsics,
                     patch_grid=(Hs, Ws),
+                    pose_bias=pose_bias,
                 )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
