@@ -280,6 +280,7 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        depth_channel_enabled: bool = False,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -299,6 +300,7 @@ class PixDiT_T2I(nn.Module):
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
+        self.depth_channel_enabled = bool(depth_channel_enabled)
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -351,6 +353,23 @@ class PixDiT_T2I(nn.Module):
                 patch_geometry_dropout,
             )
 
+        # Algebraically this is a projection of concatenated RGBD, split into the pretrained RGB
+        # weights plus two new depth-only terms. Splitting it preserves every RGB checkpoint
+        # tensor and lets depth start as an exact no-op.
+        self.patch_depth_embedder = None
+        self.pixel_depth_embedder = None
+        if self.depth_channel_enabled:
+            self.patch_depth_embedder = nn.Linear(
+                self.patch_size * self.patch_size,
+                self.hidden_size,
+                bias=False,
+            )
+            self.pixel_depth_embedder = nn.Linear(
+                1,
+                self.pixel_hidden_size,
+                bias=False,
+            )
+
         self.final_layer = FinalLayer(self.pixel_hidden_size, self.out_channels)
 
         self.precompute_pos = dict()
@@ -384,8 +403,72 @@ class PixDiT_T2I(nn.Module):
         nn.init.constant_(self.s_embedder.proj.bias, 0)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        if self.patch_depth_embedder is not None:
+            nn.init.zeros_(self.patch_depth_embedder.weight)
+            nn.init.zeros_(self.pixel_depth_embedder.weight)
         nn.init.zeros_(self.final_layer.linear.weight)
         nn.init.zeros_(self.final_layer.linear.bias)
+
+    def _prepare_depth(
+        self,
+        depth: torch.Tensor,
+        model_rows: int,
+        height: int,
+        width: int,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        if depth is None:
+            if self.depth_channel_enabled:
+                raise ValueError(
+                    "depth_channel_enabled=True requires depth [B*V,1,H,W]"
+                )
+            return None
+        if not self.depth_channel_enabled:
+            raise ValueError(
+                "depth was supplied but depth_channel_enabled=False"
+            )
+        if depth.dim() != 4 or depth.shape[1] != 1:
+            raise ValueError(
+                f"depth must be [B*V,1,H,W], got {tuple(depth.shape)}"
+            )
+        if tuple(depth.shape[-2:]) != (height, width):
+            raise ValueError(
+                f"depth spatial shape {tuple(depth.shape[-2:])} != {(height, width)}"
+            )
+        if model_rows % depth.shape[0]:
+            raise ValueError(
+                f"depth rows {depth.shape[0]} do not divide model rows {model_rows}"
+            )
+        if depth.shape[0] != model_rows:
+            depth = depth.repeat(model_rows // depth.shape[0], 1, 1, 1)
+        return depth.to(device=device, dtype=dtype)
+
+    def _embed_pixel_depth(
+        self,
+        depth: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        B = depth.shape[0]
+        Hs, Ws = height // self.patch_size, width // self.patch_size
+        projected = self.pixel_depth_embedder(
+            depth.permute(0, 2, 3, 1).contiguous()
+        )
+        projected = projected.view(
+            B,
+            Hs,
+            self.patch_size,
+            Ws,
+            self.patch_size,
+            self.pixel_hidden_size,
+        )
+        projected = projected.permute(0, 1, 3, 2, 4, 5).contiguous()
+        return projected.view(
+            B * Hs * Ws,
+            self.patch_size * self.patch_size,
+            self.pixel_hidden_size,
+        )
 
     @staticmethod
     def _prepare_patch_geometry(
@@ -436,6 +519,7 @@ class PixDiT_T2I(nn.Module):
         mask=None,
         num_views=1,
         patch_geometry=None,
+        depth=None,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -450,6 +534,14 @@ class PixDiT_T2I(nn.Module):
         Hs = H // self.patch_size
         Ws = W // self.patch_size
         L = Hs * Ws
+        depth = self._prepare_depth(
+            depth,
+            B,
+            H,
+            W,
+            x.device,
+            x.dtype,
+        )
 
         pos = self.fetch_pos(Hs, Ws, x.device)
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
@@ -471,6 +563,13 @@ class PixDiT_T2I(nn.Module):
 
         if s is None:
             s0 = self.s_embedder(x_patches)
+            if depth is not None:
+                depth_patches = F.unfold(
+                    depth,
+                    kernel_size=self.patch_size,
+                    stride=self.patch_size,
+                ).transpose(1, 2)
+                s0 = s0 + self.patch_depth_embedder(depth_patches)
             if self.patch_geometry_embedder is not None and patch_geometry is not None:
                 geometry = self._prepare_patch_geometry(
                     patch_geometry,
@@ -521,6 +620,8 @@ class PixDiT_T2I(nn.Module):
 
         s_cond = s.view(B * L, self.hidden_size)
         x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
+        if depth is not None:
+            x_pixels = x_pixels + self._embed_pixel_depth(depth, H, W)
         for blk in self.pixel_blocks:
             x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
 
