@@ -88,6 +88,7 @@ class PixDiTTrainer(nn.Module):
                 "pose_bias_margin": restore_cfg.pose_bias_margin,
                 "pose_bias_clip": restore_cfg.pose_bias_clip,
                 "pose_side_dim": restore_cfg.pose_side_dim,
+                "prope_merge_dim": restore_cfg.prope_merge_dim,
                 "prope_freq_base": restore_cfg.prope_freq_base,
             }
 

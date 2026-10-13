@@ -233,6 +233,7 @@ class MMDiTJointAttention(nn.Module):
         camera_pose_mode: str = "none",
         multi_ref_attention_mode: str = "joint",
         pose_side_dim: int = 16,
+        prope_merge_dim: int = 16,
         prope_freq_base: float = 100.0,
     ) -> None:
         super().__init__()
@@ -243,11 +244,13 @@ class MMDiTJointAttention(nn.Module):
         self.camera_pose_mode = str(camera_pose_mode)
         self.multi_ref_attention_mode = str(multi_ref_attention_mode)
         self.pose_side_dim = int(pose_side_dim)
+        self.prope_merge_dim = int(prope_merge_dim)
         if self.camera_pose_mode not in (
             "none",
             "joint_prope",
             "epipolar_bias",
             "prope_side",
+            "rope_prope_merged",
         ):
             raise ValueError(f"unsupported camera pose mode {self.camera_pose_mode!r}")
         if self.multi_ref_attention_mode not in (
@@ -306,6 +309,35 @@ class MMDiTJointAttention(nn.Module):
                 freq_base=prope_freq_base,
             )
 
+        self.prope_merge_qkv = None
+        self.prope_merge_q_norm = None
+        self.prope_merge_k_norm = None
+        self.prope_merge_gate = None
+        self.prope_merge_out = None
+        self.merged_prope = None
+        if self.camera_pose_mode == "rope_prope_merged":
+            if self.prope_merge_dim < 8 or self.prope_merge_dim % 8:
+                raise ValueError(
+                    "prope_merge_dim must be >= 8 and divisible by 8"
+                )
+            merge_width = self.num_heads * self.prope_merge_dim
+            self.prope_merge_qkv = nn.Linear(
+                self.dim, 3 * merge_width, bias=False
+            )
+            self.prope_merge_q_norm = RMSNorm(self.prope_merge_dim)
+            self.prope_merge_k_norm = RMSNorm(self.prope_merge_dim)
+            self.prope_merge_gate = nn.Parameter(
+                torch.zeros(self.num_heads)
+            )
+            self.prope_merge_out = nn.Linear(
+                merge_width, self.dim, bias=False
+            )
+            nn.init.zeros_(self.prope_merge_out.weight)
+            self.merged_prope = PropeDotProductAttention(
+                self.prope_merge_dim,
+                freq_base=prope_freq_base,
+            )
+
         self.extra_ref_gate = None
         if self.multi_ref_attention_mode == "rank0_residual":
             self.extra_ref_gate = nn.Parameter(torch.zeros(self.num_heads))
@@ -341,7 +373,9 @@ class MMDiTJointAttention(nn.Module):
         module.prepare(w2cs.float(), intrinsics.float())
 
     @staticmethod
-    def _pose_biased_attention(query, key, value, score_bias):
+    def _pose_biased_attention(
+        query, key, value, score_bias, scale
+    ):
         """Run additive-bias attention through PyTorch's stable math backend.
 
         On PyTorch 2.7, the CUDA efficient-attention backward fails for the
@@ -357,6 +391,7 @@ class MMDiTJointAttention(nn.Module):
                 value,
                 dropout_p=0.0,
                 attn_mask=score_bias,
+                scale=scale,
             )
 
     def _joint_image_attention(
@@ -372,7 +407,11 @@ class MMDiTJointAttention(nn.Module):
     ):
         if self.camera_pose_mode not in ("epipolar_bias", "prope_side"):
             return F.scaled_dot_product_attention(
-                qx, kx, vx, dropout_p=0.0
+                qx,
+                kx,
+                vx,
+                dropout_p=0.0,
+                scale=self.head_dim ** -0.5,
             )
 
         batch, heads, _, width = qx.shape
@@ -407,7 +446,11 @@ class MMDiTJointAttention(nn.Module):
                 ) * (self.pose_side_dim ** -0.5)
             outputs.append(
                 self._pose_biased_attention(
-                    query, kx, vx, score_bias
+                    query,
+                    kx,
+                    vx,
+                    score_bias,
+                    self.head_dim ** -0.5,
                 )
             )
         return torch.stack(outputs, dim=2).reshape(
@@ -446,7 +489,11 @@ class MMDiTJointAttention(nn.Module):
         base_k = k_views[:, :, :2].reshape_as(base_q)
         base_v = v_views[:, :, :2].reshape_as(base_q)
         base_output = F.scaled_dot_product_attention(
-            base_q, base_k, base_v, dropout_p=0.0
+            base_q,
+            base_k,
+            base_v,
+            dropout_p=0.0,
+            scale=self.head_dim ** -0.5,
         ).view(batch, heads, 2, tokens_per_view, width)
 
         extra_views = num_views - 2
@@ -460,7 +507,11 @@ class MMDiTJointAttention(nn.Module):
             extra_q
         )
         extra_output = F.scaled_dot_product_attention(
-            extra_q, extra_k, extra_v, dropout_p=0.0
+            extra_q,
+            extra_k,
+            extra_v,
+            dropout_p=0.0,
+            scale=self.head_dim ** -0.5,
         ).view(
             batch, extra_views, heads, tokens_per_view, width
         ).permute(0, 2, 1, 3, 4)
@@ -509,10 +560,15 @@ class MMDiTJointAttention(nn.Module):
                 cross_k,
                 cross_v,
                 dropout_p=0.0,
+                scale=self.head_dim ** -0.5,
             )
         else:
             cross_output = self._pose_biased_attention(
-                cross_query, cross_k, cross_v, cross_bias
+                cross_query,
+                cross_k,
+                cross_v,
+                cross_bias,
+                self.head_dim ** -0.5,
             )
         render_output = (
             base_output[:, :, 0]
@@ -570,6 +626,7 @@ class MMDiTJointAttention(nn.Module):
             k_views[:, :, 0].contiguous(),
             v_views[:, :, 0].contiguous(),
             dropout_p=0.0,
+            scale=self.head_dim ** -0.5,
         )
 
         reference_key = k_views[:, :, 1:].reshape(
@@ -619,6 +676,7 @@ class MMDiTJointAttention(nn.Module):
                 reference_key,
                 reference_value,
                 dropout_p=0.0,
+                scale=self.head_dim ** -0.5,
             )
         else:
             render_cross = self._pose_biased_attention(
@@ -626,6 +684,7 @@ class MMDiTJointAttention(nn.Module):
                 reference_key,
                 reference_value,
                 cross_bias,
+                self.head_dim ** -0.5,
             )
 
         # Equal mixing keeps the attention-output scale close to the original
@@ -703,6 +762,23 @@ class MMDiTJointAttention(nn.Module):
                 self.pose_side_dim,
             ).transpose(1, 2)
 
+        merge_q = merge_k = merge_v = None
+        if self.camera_pose_mode == "rope_prope_merged":
+            merge_qkv = self.prope_merge_qkv(x).reshape(
+                model_rows,
+                tokens_per_view,
+                3,
+                self.num_heads,
+                self.prope_merge_dim,
+            ).permute(2, 0, 1, 3, 4)
+            merge_q, merge_k, merge_v = (
+                merge_qkv[0],
+                merge_qkv[1],
+                merge_qkv[2],
+            )
+            merge_q = self.prope_merge_q_norm(merge_q)
+            merge_k = self.prope_merge_k_norm(merge_k)
+
         if text_on:
             qkv_y = self.qkv_y(y).reshape(
                 sample_batch,
@@ -728,6 +804,16 @@ class MMDiTJointAttention(nn.Module):
         if pose_q is not None:
             pose_q = merge_views(pose_q, num_views)
             pose_k = merge_views(pose_k, num_views)
+        if merge_q is not None:
+            merge_q = merge_views(
+                merge_q.transpose(1, 2), num_views
+            )
+            merge_k = merge_views(
+                merge_k.transpose(1, 2), num_views
+            )
+            merge_v = merge_views(
+                merge_v.transpose(1, 2), num_views
+            )
 
         if self.camera_pose_mode != "none":
             self._validate_pose_inputs(
@@ -764,6 +850,30 @@ class MMDiTJointAttention(nn.Module):
             pose_k = self.pose_side_prope.apply_to_kv(
                 pose_k.float()
             ).to(side_dtype)
+        elif self.merged_prope is not None:
+            self._prepare_prope(
+                self.merged_prope,
+                prope_w2cs,
+                prope_intrinsics,
+                patch_grid,
+                qx.device,
+            )
+            merge_dtype = qx.dtype
+            merge_q = self.merged_prope.apply_to_q(
+                merge_q.float()
+            ).to(merge_dtype)
+            merge_k = self.merged_prope.apply_to_kv(
+                merge_k.float()
+            ).to(merge_dtype)
+            merge_v = self.merged_prope.apply_to_kv(
+                merge_v.float()
+            ).to(merge_dtype)
+            merge_q = merge_q * torch.tanh(
+                self.prope_merge_gate
+            ).view(1, self.num_heads, 1, 1).to(merge_dtype)
+            qx = torch.cat((qx, merge_q), dim=-1)
+            kx = torch.cat((kx, merge_k), dim=-1)
+            vx = torch.cat((vx, merge_v), dim=-1)
 
         if text_on:
             qy = qy.transpose(1, 2)
@@ -778,6 +888,7 @@ class MMDiTJointAttention(nn.Module):
                 v_joint,
                 dropout_p=0.0,
                 attn_mask=attn_mask,
+                scale=self.head_dim ** -0.5,
             )
             image_output = out_joint[:, :, text_tokens:]
         elif self.multi_ref_attention_mode == "rank0_residual":
@@ -823,15 +934,39 @@ class MMDiTJointAttention(nn.Module):
                 image_output.float()
             ).to(output_dtype)
 
-        out_x = split_views(
+        merge_output = None
+        if self.merged_prope is not None:
+            output_dtype = image_output.dtype
+            merge_output = self.merged_prope.apply_to_output(
+                image_output[..., self.head_dim :].float()
+            ).to(output_dtype)
+            image_output = image_output[..., : self.head_dim]
+
+        out_x_heads = split_views(
             image_output, num_views, tokens_per_view
-        ).transpose(1, 2).reshape(
+        ).transpose(1, 2)
+        out_x = out_x_heads.reshape(
             model_rows, tokens_per_view, channels
         )
-        if self.multi_ref_attention_mode == "render_cross_frozen":
-            render_output = self.proj_drop_x(
-                self.proj_x(out_x[::num_views])
+        merge_out_x = None
+        if merge_output is not None:
+            merge_out_x = split_views(
+                merge_output, num_views, tokens_per_view
+            ).transpose(1, 2).reshape(
+                model_rows,
+                tokens_per_view,
+                self.num_heads * self.prope_merge_dim,
             )
+        if self.multi_ref_attention_mode == "render_cross_frozen":
+            render_output = self.proj_x(out_x[::num_views])
+            if merge_out_x is not None:
+                render_output = (
+                    render_output
+                    + self.prope_merge_out(
+                        merge_out_x[::num_views]
+                    )
+                )
+            render_output = self.proj_drop_x(render_output)
             reference_output = render_output.new_zeros(
                 sample_batch,
                 num_views - 1,
@@ -843,7 +978,10 @@ class MMDiTJointAttention(nn.Module):
                 dim=1,
             ).reshape(model_rows, tokens_per_view, channels)
         else:
-            out_x = self.proj_drop_x(self.proj_x(out_x))
+            out_x = self.proj_x(out_x)
+            if merge_out_x is not None:
+                out_x = out_x + self.prope_merge_out(merge_out_x)
+            out_x = self.proj_drop_x(out_x)
         if not text_on:
             return out_x, None
 
@@ -865,6 +1003,7 @@ class MMDiTBlockT2I(nn.Module):
         camera_pose_mode="none",
         multi_ref_attention_mode="joint",
         pose_side_dim=16,
+        prope_merge_dim=16,
         prope_freq_base=100.0,
     ):
         super().__init__()
@@ -883,6 +1022,7 @@ class MMDiTBlockT2I(nn.Module):
             camera_pose_mode=camera_pose_mode,
             multi_ref_attention_mode=multi_ref_attention_mode,
             pose_side_dim=pose_side_dim,
+            prope_merge_dim=prope_merge_dim,
             prope_freq_base=prope_freq_base,
         )
 
@@ -997,6 +1137,7 @@ class PixDiT_T2I(nn.Module):
         pose_bias_margin: float = 1.5,
         pose_bias_clip: float = 16.0,
         pose_side_dim: int = 16,
+        prope_merge_dim: int = 16,
         prope_freq_base: float = 100.0,
     ):
         super().__init__()
@@ -1023,10 +1164,12 @@ class PixDiT_T2I(nn.Module):
             "joint_prope",
             "epipolar_bias",
             "prope_side",
+            "rope_prope_merged",
         ):
             raise ValueError(
                 "camera_pose_mode must be "
-                "none|joint_prope|epipolar_bias|prope_side, "
+                "none|joint_prope|epipolar_bias|prope_side|"
+                "rope_prope_merged, "
                 f"got {self.camera_pose_mode!r}"
             )
         self.multi_ref_attention_mode = str(multi_ref_attention_mode)
@@ -1043,6 +1186,7 @@ class PixDiT_T2I(nn.Module):
         self.pose_bias_margin = float(pose_bias_margin)
         self.pose_bias_clip = float(pose_bias_clip)
         self.pose_side_dim = int(pose_side_dim)
+        self.prope_merge_dim = int(prope_merge_dim)
         self.joint_prope_enabled = self.camera_pose_mode == "joint_prope"
         self.camera_pose_enabled = self.camera_pose_mode != "none"
         if self.pixel_depth <= 0:
@@ -1066,6 +1210,7 @@ class PixDiT_T2I(nn.Module):
                 camera_pose_mode=self.camera_pose_mode,
                 multi_ref_attention_mode=self.multi_ref_attention_mode,
                 pose_side_dim=self.pose_side_dim,
+                prope_merge_dim=self.prope_merge_dim,
                 prope_freq_base=prope_freq_base,
             )
             for _ in range(self.patch_depth)
