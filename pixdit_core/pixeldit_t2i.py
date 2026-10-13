@@ -250,9 +250,14 @@ class MMDiTJointAttention(nn.Module):
             "prope_side",
         ):
             raise ValueError(f"unsupported camera pose mode {self.camera_pose_mode!r}")
-        if self.multi_ref_attention_mode not in ("joint", "rank0_residual"):
+        if self.multi_ref_attention_mode not in (
+            "joint",
+            "rank0_residual",
+            "render_cross_frozen",
+        ):
             raise ValueError(
-                "multi_ref_attention_mode must be joint|rank0_residual"
+                "multi_ref_attention_mode must be "
+                "joint|rank0_residual|render_cross_frozen"
             )
 
         self.qkv_x = nn.Linear(self.dim, self.dim * 3, bias=qkv_bias)
@@ -526,6 +531,118 @@ class MMDiTJointAttention(nn.Module):
             batch, heads, num_views * tokens_per_view, width
         )
 
+    def _render_cross_frozen_attention(
+        self,
+        qx,
+        kx,
+        vx,
+        num_views,
+        tokens_per_view,
+        pose_bias=None,
+        pose_q=None,
+        pose_k=None,
+    ):
+        """Update render queries from render self-attn and read-only references.
+
+        Reference rows are returned as zeros and are restored unchanged by the
+        enclosing block. Separate render self- and reference cross-attention
+        guarantees that the reference memory receives attention mass instead
+        of competing with render tokens in one joint softmax.
+        """
+        if num_views < 2:
+            raise ValueError(
+                "render_cross_frozen needs a render and at least one reference"
+            )
+        batch, heads, _, width = qx.shape
+        q_views = qx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+        k_views = kx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+        v_views = vx.view(
+            batch, heads, num_views, tokens_per_view, width
+        )
+
+        render_query = q_views[:, :, 0].contiguous()
+        render_self = F.scaled_dot_product_attention(
+            render_query,
+            k_views[:, :, 0].contiguous(),
+            v_views[:, :, 0].contiguous(),
+            dropout_p=0.0,
+        )
+
+        reference_key = k_views[:, :, 1:].reshape(
+            batch,
+            heads,
+            (num_views - 1) * tokens_per_view,
+            width,
+        )
+        reference_value = v_views[:, :, 1:].reshape_as(reference_key)
+        cross_bias = None
+        if self.camera_pose_mode == "epipolar_bias":
+            if pose_bias is None:
+                raise ValueError("epipolar attention requires pose_bias")
+            cross_bias = (
+                pose_bias[:, 0, :, tokens_per_view:].unsqueeze(1)
+                * self.pose_gate.view(1, heads, 1, 1)
+            ).to(qx.dtype)
+        elif self.camera_pose_mode == "prope_side":
+            pose_q_views = pose_q.view(
+                batch,
+                heads,
+                num_views,
+                tokens_per_view,
+                self.pose_side_dim,
+            )
+            reference_pose_key = pose_k.view(
+                batch,
+                heads,
+                num_views,
+                tokens_per_view,
+                self.pose_side_dim,
+            )[:, :, 1:].reshape(
+                batch,
+                heads,
+                (num_views - 1) * tokens_per_view,
+                self.pose_side_dim,
+            )
+            cross_bias = torch.einsum(
+                "bhnd,bhmd->bhnm",
+                pose_q_views[:, :, 0],
+                reference_pose_key,
+            ) * (self.pose_side_dim ** -0.5)
+
+        if cross_bias is None:
+            render_cross = F.scaled_dot_product_attention(
+                render_query,
+                reference_key,
+                reference_value,
+                dropout_p=0.0,
+            )
+        else:
+            render_cross = self._pose_biased_attention(
+                render_query,
+                reference_key,
+                reference_value,
+                cross_bias,
+            )
+
+        # Equal mixing keeps the attention-output scale close to the original
+        # single-softmax block while forcing every block to read references.
+        render_output = 0.5 * (render_self + render_cross)
+        reference_output = render_output.new_zeros(
+            batch,
+            heads,
+            num_views - 1,
+            tokens_per_view,
+            width,
+        )
+        return torch.cat(
+            (render_output.unsqueeze(2), reference_output),
+            dim=2,
+        ).reshape(batch, heads, num_views * tokens_per_view, width)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -556,7 +673,9 @@ class MMDiTJointAttention(nn.Module):
                 or self.multi_ref_attention_mode != "joint"
             )
         ):
-            raise ValueError("pose and rank0-residual attention require no text")
+            raise ValueError(
+                "non-joint image attention requires the text stream disabled"
+            )
 
         qkv_x = self.qkv_x(x).reshape(
             model_rows,
@@ -673,6 +792,18 @@ class MMDiTJointAttention(nn.Module):
                 pose_k=pose_k,
             )
             out_joint = image_output
+        elif self.multi_ref_attention_mode == "render_cross_frozen":
+            image_output = self._render_cross_frozen_attention(
+                qx,
+                kx,
+                vx,
+                num_views,
+                tokens_per_view,
+                pose_bias=pose_bias,
+                pose_q=pose_q,
+                pose_k=pose_k,
+            )
+            out_joint = image_output
         else:
             image_output = self._joint_image_attention(
                 qx,
@@ -697,7 +828,22 @@ class MMDiTJointAttention(nn.Module):
         ).transpose(1, 2).reshape(
             model_rows, tokens_per_view, channels
         )
-        out_x = self.proj_drop_x(self.proj_x(out_x))
+        if self.multi_ref_attention_mode == "render_cross_frozen":
+            render_output = self.proj_drop_x(
+                self.proj_x(out_x[::num_views])
+            )
+            reference_output = render_output.new_zeros(
+                sample_batch,
+                num_views - 1,
+                tokens_per_view,
+                channels,
+            )
+            out_x = torch.cat(
+                (render_output.unsqueeze(1), reference_output),
+                dim=1,
+            ).reshape(model_rows, tokens_per_view, channels)
+        else:
+            out_x = self.proj_drop_x(self.proj_x(out_x))
         if not text_on:
             return out_x, None
 
@@ -725,6 +871,7 @@ class MMDiTBlockT2I(nn.Module):
         self.hidden_size = hidden_size
         self.groups = groups
         self.head_dim = hidden_size // groups
+        self.multi_ref_attention_mode = str(multi_ref_attention_mode)
 
         self.norm_x1 = RMSNorm(hidden_size, eps=1e-6)
         self.norm_y1 = RMSNorm(hidden_size, eps=1e-6)
@@ -786,8 +933,32 @@ class MMDiTBlockT2I(nn.Module):
             patch_grid=patch_grid,
             pose_bias=pose_bias,
         )
-        x = x + gate_msa_x * attn_x
-        x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
+        if self.multi_ref_attention_mode == "render_cross_frozen":
+            frozen_views = x.reshape(
+                -1, num_views, x.shape[1], x.shape[2]
+            )
+            render_x = (
+                x[::num_views]
+                + gate_msa_x[::num_views] * attn_x[::num_views]
+            )
+            render_x = render_x + gate_mlp_x[::num_views] * self.mlp_x(
+                apply_adaln(
+                    self.norm_x2(render_x),
+                    shift_mlp_x[::num_views],
+                    scale_mlp_x[::num_views],
+                )
+            )
+            x = torch.cat(
+                (render_x.unsqueeze(1), frozen_views[:, 1:]),
+                dim=1,
+            ).reshape_as(x)
+        else:
+            x = x + gate_msa_x * attn_x
+            x = x + gate_mlp_x * self.mlp_x(
+                apply_adaln(
+                    self.norm_x2(x), shift_mlp_x, scale_mlp_x
+                )
+            )
         if not text_on:
             return x, None
 
@@ -859,9 +1030,14 @@ class PixDiT_T2I(nn.Module):
                 f"got {self.camera_pose_mode!r}"
             )
         self.multi_ref_attention_mode = str(multi_ref_attention_mode)
-        if self.multi_ref_attention_mode not in ("joint", "rank0_residual"):
+        if self.multi_ref_attention_mode not in (
+            "joint",
+            "rank0_residual",
+            "render_cross_frozen",
+        ):
             raise ValueError(
-                "multi_ref_attention_mode must be joint|rank0_residual"
+                "multi_ref_attention_mode must be "
+                "joint|rank0_residual|render_cross_frozen"
             )
         self.pose_shuffle = bool(pose_shuffle)
         self.pose_bias_margin = float(pose_bias_margin)
@@ -1106,8 +1282,7 @@ class PixDiT_T2I(nn.Module):
             )
         ):
             raise ValueError(
-                "pose and rank0-residual attention require the text stream "
-                "to be disabled"
+                "non-joint image attention requires the text stream disabled"
             )
         pose_bias = None
         if self.camera_pose_enabled:
