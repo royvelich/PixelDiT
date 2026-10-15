@@ -281,6 +281,7 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
         depth_channel_enabled: bool = False,
+        depth_channel_dim: int = 1,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -301,6 +302,9 @@ class PixDiT_T2I(nn.Module):
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.depth_channel_enabled = bool(depth_channel_enabled)
+        self.depth_channel_dim = int(depth_channel_dim)
+        if self.depth_channel_enabled and self.depth_channel_dim < 1:
+            raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
             raise ValueError("PixDiT_T2I expects pixel_depth > 0 to retain the pixel pathway")
 
@@ -360,12 +364,12 @@ class PixDiT_T2I(nn.Module):
         self.pixel_depth_embedder = None
         if self.depth_channel_enabled:
             self.patch_depth_embedder = nn.Linear(
-                self.patch_size * self.patch_size,
+                self.depth_channel_dim * self.patch_size * self.patch_size,
                 self.hidden_size,
                 bias=False,
             )
             self.pixel_depth_embedder = nn.Linear(
-                1,
+                self.depth_channel_dim,
                 self.pixel_hidden_size,
                 bias=False,
             )
@@ -421,16 +425,18 @@ class PixDiT_T2I(nn.Module):
         if depth is None:
             if self.depth_channel_enabled:
                 raise ValueError(
-                    "depth_channel_enabled=True requires depth [B*V,1,H,W]"
+                    "depth_channel_enabled=True requires depth "
+                    f"[B*V,{self.depth_channel_dim},H,W]"
                 )
             return None
         if not self.depth_channel_enabled:
             raise ValueError(
                 "depth was supplied but depth_channel_enabled=False"
             )
-        if depth.dim() != 4 or depth.shape[1] != 1:
+        if depth.dim() != 4 or depth.shape[1] != self.depth_channel_dim:
             raise ValueError(
-                f"depth must be [B*V,1,H,W], got {tuple(depth.shape)}"
+                "depth must be "
+                f"[B*V,{self.depth_channel_dim},H,W], got {tuple(depth.shape)}"
             )
         if tuple(depth.shape[-2:]) != (height, width):
             raise ValueError(

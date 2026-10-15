@@ -80,8 +80,14 @@ class PixDiTTrainer(nn.Module):
                 "patch_geometry_hidden_dim": restore_cfg.patch_geometry_hidden_dim,
                 "patch_geometry_dropout": restore_cfg.patch_geometry_dropout,
             }
-        if restore_cfg is not None and restore_cfg.depth_channel:
-            depth_channel_kwargs = {"depth_channel_enabled": True}
+        if (
+            restore_cfg is not None
+            and restore_cfg.depth_conditioning_enabled()
+        ):
+            depth_channel_kwargs = {
+                "depth_channel_enabled": True,
+                "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
+            }
 
         if PixDiT_T2I is None:
             raise ImportError("Failed to import PixDiT_T2I from pixdit_core.pixeldit_t2i. Check repo layout and PYTHONPATH.")
