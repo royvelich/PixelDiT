@@ -1,5 +1,2 @@
 __pycache__/
 c2i/train_logs/
-# local pre-edit backups
-*.orig
-*.orig_*
