@@ -65,6 +65,29 @@ class PixDiTTrainer(nn.Module):
         repa_encoder_index = int(extra.get("repa_encoder_index", -1))
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
+        patch_geometry_kwargs = {}
+        depth_channel_kwargs = {}
+        try:
+            from restore.config import get_active
+
+            restore_cfg = get_active()
+        except ImportError:
+            restore_cfg = None
+        if restore_cfg is not None and restore_cfg.patch_geometry:
+            patch_geometry_kwargs = {
+                "patch_geometry_enabled": True,
+                "patch_geometry_input_dim": 11,
+                "patch_geometry_hidden_dim": restore_cfg.patch_geometry_hidden_dim,
+                "patch_geometry_dropout": restore_cfg.patch_geometry_dropout,
+            }
+        if (
+            restore_cfg is not None
+            and restore_cfg.depth_conditioning_enabled()
+        ):
+            depth_channel_kwargs = {
+                "depth_channel_enabled": True,
+                "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
+            }
 
         if PixDiT_T2I is None:
             raise ImportError("Failed to import PixDiT_T2I from pixdit_core.pixeldit_t2i. Check repo layout and PYTHONPATH.")
@@ -86,6 +109,8 @@ class PixDiTTrainer(nn.Module):
             repa_encoder_index=repa_encoder_index,
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
+            **patch_geometry_kwargs,
+            **depth_channel_kwargs,
         )
 
         self.image_size = int(image_size)
@@ -105,9 +130,40 @@ class PixDiTTrainer(nn.Module):
             nn.Linear(projector_dim, 768),
         )
 
-    def forward(self, x, timestep, y, mask=None, data_info=None, repa_tokens=None, **kwargs):
+    def forward(self, x, timestep, y=None, mask=None, data_info=None, repa_tokens=None, num_views=1, **kwargs):
+        """``num_views`` > 1: ``x`` and ``timestep`` are per ROW (``B*V``, b-major), while ``y``
+        and ``mask`` are per SAMPLE (``B``) because the text stream is shared across a sample's
+        views. Forwarded verbatim to the core; the return shape is unchanged (``[B*V,3,H,W]``
+        under key ``"x"``), so every per-row loss downstream keeps working untouched.
+        """
         x = x.to(self.dtype)
         timestep = timestep.to(self.dtype)
+        patch_geometry = (
+            data_info.get("patch_geometry")
+            if isinstance(data_info, dict)
+            else None
+        )
+        depth = (
+            data_info.get("depth")
+            if isinstance(data_info, dict)
+            else None
+        )
+        if y is None:
+            # Text stream disabled: nothing to squeeze, check or cast. The core skips every
+            # text-shaped module rather than being fed zeros, so no text weight is touched.
+            if hasattr(self.core, "last_repa_tokens"):
+                self.core.last_repa_tokens = None
+            out = self.core(
+                x,
+                timestep,
+                None,
+                s=None,
+                mask=None,
+                num_views=num_views,
+                patch_geometry=patch_geometry,
+                depth=depth,
+            )
+            return {"x": out, "repa_loss": None}
         if y.dim() == 4:
             y_proc = y.squeeze(1)
         elif y.dim() == 3:
@@ -125,7 +181,16 @@ class PixDiTTrainer(nn.Module):
         if hasattr(self.core, "last_repa_tokens"):
             self.core.last_repa_tokens = None
 
-        out = self.core(x, timestep, y_proc, s=None, mask=None)
+        out = self.core(
+            x,
+            timestep,
+            y_proc,
+            s=None,
+            mask=None,
+            num_views=num_views,
+            patch_geometry=patch_geometry,
+            depth=depth,
+        )
         repa_loss = None
         if repa_tokens is not None:
             repa_tokens = repa_tokens.to(self.dtype)
@@ -156,7 +221,7 @@ class PixDiTTrainer(nn.Module):
                     repa_loss = -((proj_tokens * repa_tokens).sum(dim=-1)).mean()
         return {"x": out, "repa_loss": repa_loss}
 
-    def forward_with_dpmsolver(self, x, timestep, y, mask=None, **kwargs):
+    def forward_with_dpmsolver(self, x, timestep, y=None, mask=None, **kwargs):
         out = self.forward(x, timestep, y, mask, **kwargs)
         if isinstance(out, dict):
             return out["x"]
@@ -165,5 +230,4 @@ class PixDiTTrainer(nn.Module):
     @property
     def dtype(self):
         return next(self.parameters()).dtype
-
 

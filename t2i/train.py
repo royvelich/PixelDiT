@@ -49,7 +49,7 @@ from diffusion.model.respace import compute_density_for_timestep_sampling
 from diffusion.model.utils import get_weight_dtype
 from diffusion.utils.checkpoint import load_checkpoint, save_checkpoint
 from diffusion.utils.config import PixDiTConfig, model_init_config
-from diffusion.data.builder import AspectRatioBatchSampler
+from diffusion.data.builder import AspectRatioBatchSampler, DistributedAspectRatioBatchSampler
 from diffusion.utils.dist_utils import flush, get_world_size
 from diffusion.utils.logger import LogBuffer, get_root_logger
 from diffusion.utils.lr_scheduler import build_lr_scheduler
@@ -90,6 +90,47 @@ def set_fsdp_env():
     os.environ["FSDP_REDUCE_SCATTER_PRECISION"] = "fp32"
     os.environ["FSDP_ALL_GATHER_PRECISION"] = "fp32"
     os.environ["FSDP_OPTIMIZER_STATE_PRECISION"] = "fp32"
+
+
+def _restore_text_disabled() -> bool:
+    """[restore edit] True when the restoration wrapper has switched the text stream off.
+
+    Guarded so upstream and non-restore use are unaffected: with no restore config installed this
+    is always False and every text path below behaves exactly as before.
+    """
+    try:
+        from restore.config import text_disabled
+
+        return bool(text_disabled())
+    except Exception:
+        return False
+
+
+def _restore_active() -> bool:
+    """Return whether the restoration extension is installed for this process."""
+    try:
+        from restore.config import get_active
+
+        return get_active() is not None
+    except Exception:
+        return False
+
+
+def _should_visualize(config, global_step: int, local_step: int, restoration_active: bool) -> bool:
+    """Keep upstream epoch-start sampling, except when restoration owns validation scheduling."""
+    return bool(config.train.visualize) and (
+        global_step % config.train.eval_sampling_steps == 0
+        or (local_step == 0 and not restoration_active)
+    )
+
+
+def _should_prepare_visualization_text(config, no_text: bool) -> bool:
+    """Prompt caches are upstream text-to-image inputs, not restoration validation inputs."""
+    return (
+        not no_text
+        and bool(config.train.visualize)
+        and bool(config.train.validation_prompts)
+    )
 
 
 def ema_update(model_dest, model_src, rate):
@@ -252,16 +293,33 @@ def train(
 ):
     log_buffer = LogBuffer()
 
-    # [restore edit] anchor the perceptual warmup ramp to where this run starts
-    # (0 from scratch, resume step on resume). Guarded so upstream/non-restore
-    # use is unaffected.
+    # [restore edit] Recomputed here rather than threaded in: train() takes no restore argument, and
+    # the call is a cheap module-global read.
+    _train_no_text = _restore_text_disabled()
+    _restoration_active = _restore_active()
+
+    # [restore edit] Anchor the perceptual warmup ramp to where THIS run starts (0 from
+    # scratch, the resume step on resume), so a resumed run ramps fresh instead of finding
+    # the ramp already in the past. Guarded so upstream / non-restore use is unaffected.
     try:
         from restore.config import set_start_step
+
         set_start_step(start_step)
     except Exception:
         pass
 
     global_step = start_step + 1
+    max_train_steps = int(getattr(config.train, "max_train_steps", 0) or 0)
+    if max_train_steps < 0:
+        raise ValueError(
+            f"train.max_train_steps must be >= 0, got {max_train_steps}"
+        )
+    if max_train_steps and start_step >= max_train_steps:
+        raise ValueError(
+            "resume checkpoint is already at or beyond "
+            f"train.max_train_steps: start_step={start_step}, "
+            f"max_train_steps={max_train_steps}"
+        )
     skip_step = max(config.train.skip_step, global_step) % train_dataloader_len
     skip_step = skip_step if skip_step < (train_dataloader_len - 20) else 0
     loss_nan_timer = 0
@@ -317,8 +375,9 @@ def train(
     # Now you train the model
     for epoch in range(start_epoch + 1, config.train.num_epochs + 1):
         time_start, last_tic = time.time(), time.time()
-        sampler = (
-            train_dataloader.batch_sampler.sampler
+        batch_sampler = train_dataloader.batch_sampler
+        sampler = batch_sampler if hasattr(batch_sampler, "set_start") else (
+            batch_sampler.sampler
             if (num_replicas > 1 or config.model.multi_scale)
             else train_dataloader.sampler
         )
@@ -359,7 +418,11 @@ def train(
             lm_time_start = time.time()
             bs = clean_images.shape[0]
 
-            if load_text_feat:
+            # [restore edit] No text stream: the model takes y=None and skips every text-shaped
+            # module, rather than being handed zeros through weights it still pays to run.
+            if _train_no_text:
+                y = y_mask = None
+            elif load_text_feat:
                 y = batch[1]  # bs, 1, N, C
                 y_mask = batch[2]  # bs, 1, 1, N
             else:
@@ -455,9 +518,11 @@ def train(
                                 repa_tokens = feats["tokens"][:, 1:]
                         elif isinstance(feats, torch.Tensor):
                             repa_tokens = feats[:, 1:]
-                # [restore edit] publish live step for the perceptual warmup ramp
+                # [restore edit] Publish the live step: training_losses cannot see it from
+                # its own signature, and the perceptual warmup ramp needs it.
                 try:
                     from restore.config import set_step
+
                     set_step(global_step)
                 except Exception:
                     pass
@@ -495,19 +560,23 @@ def train(
                 logs.update(repa_loss=accelerator.gather(repa_loss).mean().item())
             if grad_norm is not None:
                 logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
-            # [restore edit] surface the image-space terms and the warmup ramp.
-            # Upstream logs only the total loss, so a folded-in LPIPS/Gram term
-            # is indistinguishable from it being off -- and the ramp would be
-            # invisible. Guarded: absent keys simply do not appear.
+            # [restore edit] Surface every extra term training_losses returned. Upstream logs
+            # only the TOTAL, so a folded-in LPIPS / Gram / reference term is indistinguishable
+            # from it being switched off. Deliberately DATA-DRIVEN rather than a fixed key
+            # list: a new loss term added in restore.diffusion shows up here with no further
+            # edit to this file. "loss" is already reported as the total and "extra" is a dict
+            # handled above, so both are skipped.
             try:
                 if isinstance(loss_term, dict):
-                    for _k in ("lpips", "gram", "flow", "ref_recon"):
-                        if loss_term.get(_k) is not None:
-                            logs[_k] = accelerator.gather(
-                                loss_term[_k].mean() if hasattr(loss_term[_k], "mean")
-                                else loss_term[_k]
-                            ).mean().item()
+                    for _k, _v in loss_term.items():
+                        if _k in ("loss", "extra") or _k.startswith("_") or _v is None:
+                            continue
+                        if torch.is_tensor(_v):
+                            logs[_k] = accelerator.gather(_v.detach().float().mean()).mean().item()
+                        elif isinstance(_v, (int, float)):
+                            logs[_k] = float(_v)
                 from restore.config import get_active as _ga, get_step as _gs
+
                 _rc = _ga()
                 if _rc is not None and _rc.perceptual_enabled():
                     logs["perceptual_warmup"] = _rc.perceptual_warmup_factor(_gs())
@@ -570,12 +639,16 @@ def train(
                 accelerator.log(logs, step=global_step)
 
             global_step += 1
+            reached_max_train_steps = (
+                max_train_steps > 0 and global_step >= max_train_steps
+            )
 
             if loss_nan_timer > 20:
                 raise ValueError("Loss is NaN too much times. Break here.")
             if (
                 global_step % config.train.save_model_steps == 0
                 or (time.time() - training_start_time) / 3600 > config.train.early_stop_hours
+                or reached_max_train_steps
             ):
                 torch.cuda.synchronize()
                 accelerator.wait_for_everyone()
@@ -622,18 +695,25 @@ def train(
                     logger.info(f"Stopping training at epoch {epoch}, step {global_step} due to time limit.")
                     return
 
-            if config.train.visualize and (global_step % config.train.eval_sampling_steps == 0 or (step + 1) == 1):
+            if (
+                _should_visualize(
+                    config, global_step, step, _restoration_active
+                )
+                or (
+                    reached_max_train_steps
+                    and bool(config.train.visualize)
+                )
+            ):
                 if config.train.use_fsdp:
                     merged_state_dict = accelerator.get_state_dict(model)
 
                 accelerator.wait_for_everyone()
-                # [restore edit] Run validation on ALL ranks when not using FSDP,
-                # so the restoration hook can shard the pairs across GPUs (each
-                # rank samples records[rank::world_size] then gathers to rank 0).
-                # Upstream gated this on is_main_process, which deadlocks any
-                # collective inside log_validation. FSDP keeps the original
-                # main-process-only path: only the main process holds the merged
-                # weights, so non-main ranks must not sample.
+                # [restore edit] Run validation on ALL ranks when not using FSDP, so the
+                # restoration hook can shard the validation pairs across GPUs (each rank takes
+                # records[rank::world_size], then gathers to rank 0). Upstream gated this on
+                # is_main_process, which deadlocks any collective inside log_validation.
+                # FSDP keeps the original main-process-only path: only the main process holds
+                # the merged weights, so non-main ranks must not sample.
                 _restore_run_val = (not config.train.use_fsdp) or accelerator.is_main_process
                 if _restore_run_val:
                     if config.train.use_fsdp:
@@ -657,7 +737,16 @@ def train(
                             step=global_step,
                             device=accelerator.device,
                         )
-                
+
+            if reached_max_train_steps:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    logger.info(
+                        "[train] Reached "
+                        f"max_train_steps={max_train_steps} after final "
+                        "checkpoint and validation; stopping."
+                    )
+                return
 
             # avoid dead-lock of multiscale data batch sampler
             if (
@@ -815,7 +904,14 @@ def main(cfg: PixDiTConfig) -> None:
         else None
     )
     tokenizer = text_encoder = None
-    if not config.data.load_text_feat:
+    # [restore edit] With the text stream disabled there is nothing to encode, so the text encoder
+    # is not loaded at all -- Gemma-2-2b costs minutes of startup and several GB of VRAM for a model
+    # that would never be called. text_embed_dim falls back to the config value in the else branch,
+    # and every later text path is already guarded on `tokenizer is not None`.
+    _no_text = _restore_text_disabled()
+    if _no_text:
+        logger.info("[restore] text stream DISABLED: skipping the text-encoder load entirely")
+    if not config.data.load_text_feat and not _no_text:
         tokenizer, text_encoder = get_tokenizer_and_text_encoder(
             name=config.text_encoder.text_encoder_name, device=accelerator.device
         )
@@ -840,6 +936,10 @@ def main(cfg: PixDiTConfig) -> None:
         config.train.null_embed_root,
         f"null_embed_diffusers_{safe_text_encoder_name}_{max_length}token_{text_embed_dim}.pth",
     )
+    if _no_text:
+        # A no-text model has no y_embedder, so loading image weights must not depend on a cached
+        # unconditional prompt tensor.
+        null_embed_path = None
 
     # training-time null prompt embedding for CFG dropout (when not loading text feat)
     null_y_train = None
@@ -857,7 +957,7 @@ def main(cfg: PixDiTConfig) -> None:
         null_y_mask = null_attention_mask_train[:, None, None, :]  # [1, 1, 1, L]
 
     # 2.preparing embeddings for visualization. We put it here for saving GPU memory
-    if config.train.visualize and len(config.train.validation_prompts):
+    if _should_prepare_visualization_text(config, _no_text):
         valid_prompt_embed_suffix = f"{max_length}token_{safe_text_encoder_name}_{text_embed_dim}.pth"
         validation_prompts = config.train.validation_prompts
         skip = True
@@ -1040,7 +1140,14 @@ def main(cfg: PixDiTConfig) -> None:
         vae_downsample_rate=config.vae.vae_downsample_rate,
     )
     accelerator.wait_for_everyone()
-    if config.model.multi_scale:
+    use_distributed_aspect_batches = bool(
+        getattr(dataset, "requires_aspect_batching", False)
+    )
+    if use_distributed_aspect_batches and args.caching:
+        raise ValueError(
+            "Dataset-managed distributed aspect batching does not support --caching."
+        )
+    if config.model.multi_scale or use_distributed_aspect_batches:
         drop_last = True
         uuid = hashlib.sha256("-".join(config.data.data_dir).encode()).hexdigest()[:8]
         # Estimate cache file size: entries * avg bytes (tunable via env)
@@ -1063,9 +1170,7 @@ def main(cfg: PixDiTConfig) -> None:
         )
         cache_file = f"{base_pattern}-num_replicas{num_replicas}-rank{rank}-{dataset_key}.json"
 
-        sampler = DistributedRangedSampler(dataset, num_replicas=num_replicas, rank=rank)
-        batch_sampler = AspectRatioBatchSampler(
-            sampler=sampler,
+        batch_sampler_kwargs = dict(
             dataset=dataset,
             batch_size=config.train.train_batch_size,
             aspect_ratios=dataset.aspect_ratio,
@@ -1078,6 +1183,23 @@ def main(cfg: PixDiTConfig) -> None:
             caching=args.caching,
             clipscore_filter_thres=args.data.del_img_clip_thr,
         )
+        if use_distributed_aspect_batches:
+            batch_sampler = DistributedAspectRatioBatchSampler(
+                num_replicas=num_replicas,
+                rank=rank,
+                **batch_sampler_kwargs,
+            )
+            logger.info(
+                f"Using distributed aspect batches: {len(batch_sampler)} batches per rank"
+            )
+        else:
+            sampler = DistributedRangedSampler(
+                dataset, num_replicas=num_replicas, rank=rank
+            )
+            batch_sampler = AspectRatioBatchSampler(
+                sampler=sampler,
+                **batch_sampler_kwargs,
+            )
         train_dataloader = build_dataloader(dataset, batch_sampler=batch_sampler, num_workers=config.train.num_workers)
         train_dataloader_len = len(train_dataloader)
         logger.info(f"rank-{rank} Cached file len: {len(train_dataloader.batch_sampler.cached_idx)}")
