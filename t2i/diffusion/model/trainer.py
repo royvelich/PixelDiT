@@ -67,6 +67,7 @@ class PixDiTTrainer(nn.Module):
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
         depth_channel_kwargs = {}
+        camera_conditioning_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -87,6 +88,20 @@ class PixDiTTrainer(nn.Module):
             depth_channel_kwargs = {
                 "depth_channel_enabled": True,
                 "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
+            }
+        if (
+            restore_cfg is not None
+            and restore_cfg.camera_conditioning_enabled()
+        ):
+            camera_conditioning_kwargs = {
+                "camera_conditioning_mode": (
+                    restore_cfg.camera_conditioning_mode
+                ),
+                "camera_ray_rows": restore_cfg.camera_ray_rows,
+                "camera_conditioning_dropout": (
+                    restore_cfg.camera_conditioning_dropout
+                ),
+                "prope_freq_base": restore_cfg.prope_freq_base,
             }
 
         if PixDiT_T2I is None:
@@ -111,6 +126,7 @@ class PixDiTTrainer(nn.Module):
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
             **depth_channel_kwargs,
+            **camera_conditioning_kwargs,
         )
 
         self.image_size = int(image_size)
@@ -148,6 +164,16 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        camera_w2cs = (
+            data_info.get("camera_w2cs")
+            if isinstance(data_info, dict)
+            else None
+        )
+        camera_intrinsics = (
+            data_info.get("camera_intrinsics")
+            if isinstance(data_info, dict)
+            else None
+        )
         if y is None:
             # Text stream disabled: nothing to squeeze, check or cast. The core skips every
             # text-shaped module rather than being fed zeros, so no text weight is touched.
@@ -162,6 +188,8 @@ class PixDiTTrainer(nn.Module):
                 num_views=num_views,
                 patch_geometry=patch_geometry,
                 depth=depth,
+                camera_w2cs=camera_w2cs,
+                camera_intrinsics=camera_intrinsics,
             )
             return {"x": out, "repa_loss": None}
         if y.dim() == 4:
@@ -190,6 +218,8 @@ class PixDiTTrainer(nn.Module):
             num_views=num_views,
             patch_geometry=patch_geometry,
             depth=depth,
+            camera_w2cs=camera_w2cs,
+            camera_intrinsics=camera_intrinsics,
         )
         repa_loss = None
         if repa_tokens is not None:

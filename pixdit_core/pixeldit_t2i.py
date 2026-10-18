@@ -14,6 +14,7 @@ from .modules import (
     apply_rotary_emb,
     precompute_freqs_cis_2d,
 )
+from .prope import PropeDotProductAttention, invert_se3
 
 
 def merge_views(t: torch.Tensor, num_views: int) -> torch.Tensor:
@@ -53,6 +54,69 @@ def split_views(t: torch.Tensor, num_views: int, tokens_per_view: int) -> torch.
         .permute(0, 2, 1, 3, 4)
         .reshape(B * num_views, H, tokens_per_view, D)
     )
+
+
+def build_plucker_ray_patches(
+    viewmats: torch.Tensor,
+    intrinsics: torch.Tensor,
+    height: int,
+    width: int,
+    patch_size: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return PixelUnshuffle-equivalent Plucker features ``[B*V,L,6*P*P]``.
+
+    ``viewmats`` are camera-from-target transforms and ``intrinsics`` use
+    PRoPE's normalized image coordinates. Rays are expressed in the render
+    camera's coordinate frame, so every view shares one canonical frame.
+    """
+    if viewmats.dim() != 4 or viewmats.shape[-2:] != (4, 4):
+        raise ValueError("camera view matrices must be [B,V,4,4]")
+    if intrinsics.shape != viewmats.shape[:2] + (3, 3):
+        raise ValueError("camera intrinsics must be [B,V,3,3]")
+    if height % patch_size or width % patch_size:
+        raise ValueError(
+            f"image {(height, width)} is not divisible by patch size {patch_size}"
+        )
+    device = viewmats.device
+    with torch.autocast(device_type=device.type, enabled=False):
+        w2cs = viewmats.float()
+        Ks = intrinsics.float()
+        c2ws = invert_se3(w2cs)
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=device, dtype=torch.float32),
+            torch.arange(width, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
+        pixels = torch.stack(
+            [
+                xx / float(width) - 0.5,
+                yy / float(height) - 0.5,
+                torch.ones_like(xx),
+            ],
+            dim=-1,
+        )
+        camera_rays = torch.einsum(
+            "bvij,hwj->bvhwi", torch.linalg.inv(Ks), pixels
+        )
+        directions = F.normalize(
+            torch.einsum(
+                "bvij,bvhwj->bvhwi", c2ws[..., :3, :3], camera_rays
+            ),
+            dim=-1,
+        )
+        origins = c2ws[..., :3, 3].unsqueeze(-2).unsqueeze(-2)
+        origins = origins.expand_as(directions)
+        moments = torch.cross(origins, directions, dim=-1)
+        raymaps = torch.cat([moments, directions], dim=-1)
+        batch, views = raymaps.shape[:2]
+        raymaps = raymaps.permute(0, 1, 4, 2, 3).reshape(
+            batch * views, 6, height, width
+        )
+        patches = F.unfold(
+            raymaps, kernel_size=patch_size, stride=patch_size
+        ).transpose(1, 2)
+    return patches.to(dtype=dtype)
 
 
 class PatchGeometryEmbedder(nn.Module):
@@ -131,6 +195,112 @@ class MMDiTJointAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop_x = nn.Dropout(proj_drop)
         self.proj_drop_y = nn.Dropout(proj_drop)
+        self.prope_ref_k = None
+        self.prope_ref_v = None
+        self.prope_ref_k_norm = None
+        self.prope_source = None
+        self.prope_references = None
+
+    def enable_prope_reference_attention(self, freq_base: float = 100.0) -> None:
+        """Add ArtiFixer-style render-query/reference-KV attention."""
+        if self.prope_ref_k is not None:
+            return
+        self.prope_ref_k = nn.Linear(self.dim, self.dim, bias=True)
+        self.prope_ref_v = nn.Linear(self.dim, self.dim, bias=True)
+        self.prope_ref_k_norm = RMSNorm(self.head_dim)
+        self.prope_source = PropeDotProductAttention(
+            self.head_dim, freq_base=freq_base
+        )
+        self.prope_references = PropeDotProductAttention(
+            self.head_dim, freq_base=freq_base
+        )
+        nn.init.zeros_(self.prope_ref_v.weight)
+        nn.init.zeros_(self.prope_ref_v.bias)
+
+    def _prope_reference_attention(
+        self,
+        x: torch.Tensor,
+        render_query: torch.Tensor,
+        num_views: int,
+        viewmats: torch.Tensor,
+        intrinsics: torch.Tensor,
+        patch_grid,
+        camera_keep: torch.Tensor,
+    ) -> torch.Tensor:
+        """Render queries attend to every reference token; refs get zero output."""
+        if num_views <= 1:
+            return torch.zeros_like(x)
+        batch_rows, tokens, channels = x.shape
+        if batch_rows % num_views:
+            raise ValueError(
+                f"image rows {batch_rows} are not divisible by num_views={num_views}"
+            )
+        batch = batch_rows // num_views
+        if viewmats.shape != (batch, num_views, 4, 4):
+            raise ValueError(
+                "PRoPE view matrices must be "
+                f"{(batch, num_views, 4, 4)}, got {tuple(viewmats.shape)}"
+            )
+        if intrinsics.shape != (batch, num_views, 3, 3):
+            raise ValueError(
+                "PRoPE intrinsics must be "
+                f"{(batch, num_views, 3, 3)}, got {tuple(intrinsics.shape)}"
+            )
+        if patch_grid is None or len(patch_grid) != 2:
+            raise ValueError("PRoPE reference attention requires a patch grid")
+        patch_height, patch_width = (int(value) for value in patch_grid)
+        if patch_height * patch_width != tokens:
+            raise ValueError(
+                f"patch grid {(patch_height, patch_width)} has "
+                f"{patch_height * patch_width} tokens, expected {tokens}"
+            )
+
+        references = x.view(batch, num_views, tokens, channels)[:, 1:]
+        num_refs = num_views - 1
+        key = self.prope_ref_k(references).view(
+            batch, num_refs, tokens, self.num_heads, self.head_dim
+        )
+        value = self.prope_ref_v(references).view(
+            batch, num_refs, tokens, self.num_heads, self.head_dim
+        )
+        key = self.prope_ref_k_norm(key)
+        key = key.permute(0, 3, 1, 2, 4).reshape(
+            batch, self.num_heads, num_refs * tokens, self.head_dim
+        )
+        value = value.permute(0, 3, 1, 2, 4).reshape(
+            batch, self.num_heads, num_refs * tokens, self.head_dim
+        )
+        query = render_query.view(
+            batch, num_views, self.num_heads, tokens, self.head_dim
+        )[:, 0]
+
+        self.prope_source.update_coeffs(
+            patch_width, patch_height, query.device
+        )
+        self.prope_references.update_coeffs(
+            patch_width, patch_height, query.device
+        )
+        self.prope_source.prepare(viewmats[:, :1], intrinsics[:, :1])
+        self.prope_references.prepare(viewmats[:, 1:], intrinsics[:, 1:])
+
+        attention_dtype = query.dtype
+        query = self.prope_source.apply_to_q(query).to(attention_dtype)
+        key = self.prope_references.apply_to_kv(key).to(attention_dtype)
+        value = self.prope_references.apply_to_kv(value).to(attention_dtype)
+        output = F.scaled_dot_product_attention(
+            query, key, value, dropout_p=0.0
+        )
+        output = self.prope_source.apply_to_output(output).to(attention_dtype)
+        output = output.transpose(1, 2).reshape(batch, tokens, channels)
+        if camera_keep is not None:
+            if camera_keep.shape != (batch, 1, 1):
+                raise ValueError(
+                    "camera_keep must be "
+                    f"{(batch, 1, 1)}, got {tuple(camera_keep.shape)}"
+                )
+            output = output * camera_keep.to(output.dtype)
+        zeros = output.new_zeros(batch, num_refs, tokens, channels)
+        return torch.cat([output[:, None], zeros], dim=1).reshape_as(x)
 
     def forward(
             self,
@@ -140,6 +310,10 @@ class MMDiTJointAttention(nn.Module):
             pos_txt: torch.Tensor = None,
             attn_mask: torch.Tensor = None,
             num_views: int = 1,
+            prope_w2cs: torch.Tensor = None,
+            prope_intrinsics: torch.Tensor = None,
+            patch_grid=None,
+            camera_keep: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # y is None when the text stream is disabled: the attention then runs single-stream over
         # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
@@ -162,6 +336,7 @@ class MMDiTJointAttention(nn.Module):
         qx, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
         qx = self.q_norm_x(qx)
         kx = self.k_norm_x(kx)
+        render_query = qx
 
         # Note the batch: image tokens are at B (== B*V), text at By. Using B here would be a
         # shape error at V>1 and a silent no-op at V=1.
@@ -202,6 +377,20 @@ class MMDiTJointAttention(nn.Module):
         n_txt = Ny if text_on else 0
         out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
         out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
+        if self.prope_ref_k is not None:
+            if prope_w2cs is None or prope_intrinsics is None:
+                raise ValueError(
+                    "PRoPE reference attention requires camera matrices"
+                )
+            out_x = out_x + self._prope_reference_attention(
+                x,
+                render_query,
+                num_views,
+                prope_w2cs,
+                prope_intrinsics,
+                patch_grid,
+                camera_keep,
+            )
         out_x = self.proj_drop_x(self.proj_x(out_x))
 
         if not text_on:
@@ -232,8 +421,40 @@ class MMDiTBlockT2I(nn.Module):
 
         self.adaLN_modulation_img = adaLN_modulation_img if adaLN_modulation_img is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.adaLN_modulation_txt = adaLN_modulation_txt if adaLN_modulation_txt is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+        self.camera_ray_embedder = None
 
-    def forward(self, x, y, c, pos_img, pos_txt=None, attn_mask=None, num_views=1):
+    def enable_camera_conditioning(
+        self,
+        ray_patch_dim: int,
+        rays_enabled: bool,
+        prope_enabled: bool,
+        prope_freq_base: float,
+    ) -> None:
+        if rays_enabled:
+            self.camera_ray_embedder = nn.Linear(
+                int(ray_patch_dim), self.hidden_size, bias=True
+            )
+            nn.init.zeros_(self.camera_ray_embedder.weight)
+            nn.init.zeros_(self.camera_ray_embedder.bias)
+        if prope_enabled:
+            self.attn.enable_prope_reference_attention(prope_freq_base)
+
+    def forward(
+        self,
+        x,
+        y,
+        c,
+        pos_img,
+        pos_txt=None,
+        attn_mask=None,
+        num_views=1,
+        camera_ray_patches=None,
+        camera_ray_keep=None,
+        prope_w2cs=None,
+        prope_intrinsics=None,
+        patch_grid=None,
+        camera_keep=None,
+    ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
         # exactly `c[::num_views]`. A no-op at num_views=1.
@@ -244,8 +465,30 @@ class MMDiTBlockT2I(nn.Module):
             shift_msa_y, scale_msa_y, gate_msa_y, shift_mlp_y, scale_mlp_y, gate_mlp_y = self.adaLN_modulation_txt(c_txt).chunk(6, dim=-1)
 
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
+        if self.camera_ray_embedder is not None:
+            if camera_ray_patches is None:
+                raise ValueError(
+                    "camera-ray conditioning requires camera_ray_patches"
+                )
+            ray_embedding = self.camera_ray_embedder(camera_ray_patches)
+            if camera_ray_keep is not None:
+                ray_embedding = ray_embedding * camera_ray_keep.to(
+                    ray_embedding.dtype
+                )
+            x_norm = x_norm + ray_embedding
         y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
-        attn_x, attn_y = self.attn(x_norm, y_norm, pos_img, pos_txt, attn_mask, num_views)
+        attn_x, attn_y = self.attn(
+            x_norm,
+            y_norm,
+            pos_img,
+            pos_txt,
+            attn_mask,
+            num_views,
+            prope_w2cs=prope_w2cs,
+            prope_intrinsics=prope_intrinsics,
+            patch_grid=patch_grid,
+            camera_keep=camera_keep,
+        )
         x = x + gate_msa_x * attn_x
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
         if not text_on:
@@ -282,6 +525,10 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_dropout: float = 0.0,
         depth_channel_enabled: bool = False,
         depth_channel_dim: int = 1,
+        camera_conditioning_mode: str = "none",
+        camera_ray_rows: str = "all",
+        camera_conditioning_dropout: float = 0.0,
+        prope_freq_base: float = 100.0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -303,6 +550,34 @@ class PixDiT_T2I(nn.Module):
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.depth_channel_enabled = bool(depth_channel_enabled)
         self.depth_channel_dim = int(depth_channel_dim)
+        self.camera_conditioning_mode = str(camera_conditioning_mode)
+        if self.camera_conditioning_mode not in (
+            "none",
+            "rays",
+            "prope",
+            "rays_prope",
+        ):
+            raise ValueError(
+                "camera_conditioning_mode must be "
+                "none|rays|prope|rays_prope"
+            )
+        self.camera_rays_enabled = self.camera_conditioning_mode in (
+            "rays",
+            "rays_prope",
+        )
+        self.camera_prope_enabled = self.camera_conditioning_mode in (
+            "prope",
+            "rays_prope",
+        )
+        self.camera_ray_rows = str(camera_ray_rows)
+        if self.camera_ray_rows not in ("all", "render"):
+            raise ValueError("camera_ray_rows must be all|render")
+        self.camera_conditioning_dropout = float(camera_conditioning_dropout)
+        if not (0.0 <= self.camera_conditioning_dropout < 1.0):
+            raise ValueError("camera_conditioning_dropout must be in [0,1)")
+        self.prope_freq_base = float(prope_freq_base)
+        if self.prope_freq_base <= 0:
+            raise ValueError("prope_freq_base must be positive")
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
             raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
@@ -381,6 +656,17 @@ class PixDiT_T2I(nn.Module):
         self.last_repa_tokens = None
 
         self.initialize_weights()
+        if self.camera_conditioning_mode != "none":
+            # New modules must not perturb initialization of any pre-existing
+            # PixelDiT parameter. They are also zero-output at step zero.
+            with torch.random.fork_rng(devices=[]):
+                for block in self.patch_blocks:
+                    block.enable_camera_conditioning(
+                        ray_patch_dim=6 * self.patch_size * self.patch_size,
+                        rays_enabled=self.camera_rays_enabled,
+                        prope_enabled=self.camera_prope_enabled,
+                        prope_freq_base=self.prope_freq_base,
+                    )
 
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:
@@ -449,6 +735,52 @@ class PixDiT_T2I(nn.Module):
         if depth.shape[0] != model_rows:
             depth = depth.repeat(model_rows // depth.shape[0], 1, 1, 1)
         return depth.to(device=device, dtype=dtype)
+
+    @staticmethod
+    def _prepare_camera_conditioning(
+        viewmats: torch.Tensor,
+        intrinsics: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        device,
+    ):
+        if viewmats.dim() == 3:
+            viewmats = viewmats.unsqueeze(0)
+        if intrinsics.dim() == 3:
+            intrinsics = intrinsics.unsqueeze(0)
+        if viewmats.dim() != 4 or viewmats.shape[1:] != (num_views, 4, 4):
+            raise ValueError(
+                "camera view matrices must be [B,V,4,4], "
+                f"got {tuple(viewmats.shape)}"
+            )
+        if (
+            intrinsics.dim() != 4
+            or intrinsics.shape[1:] != (num_views, 3, 3)
+        ):
+            raise ValueError(
+                "camera intrinsics must be [B,V,3,3], "
+                f"got {tuple(intrinsics.shape)}"
+            )
+        if model_rows % num_views:
+            raise ValueError(
+                f"model rows {model_rows} are not divisible by num_views={num_views}"
+            )
+        model_batch = model_rows // num_views
+        if model_batch % viewmats.shape[0]:
+            raise ValueError(
+                f"camera batch {viewmats.shape[0]} does not divide "
+                f"model batch {model_batch}"
+            )
+        if intrinsics.shape[0] != viewmats.shape[0]:
+            raise ValueError("camera extrinsic and intrinsic batches disagree")
+        if viewmats.shape[0] != model_batch:
+            repeats = model_batch // viewmats.shape[0]
+            viewmats = viewmats.repeat(repeats, 1, 1, 1)
+            intrinsics = intrinsics.repeat(repeats, 1, 1, 1)
+        return (
+            viewmats.to(device=device, dtype=torch.float32),
+            intrinsics.to(device=device, dtype=torch.float32),
+        )
 
     def _embed_pixel_depth(
         self,
@@ -526,6 +858,8 @@ class PixDiT_T2I(nn.Module):
         num_views=1,
         patch_geometry=None,
         depth=None,
+        camera_w2cs=None,
+        camera_intrinsics=None,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -548,6 +882,63 @@ class PixDiT_T2I(nn.Module):
             x.device,
             x.dtype,
         )
+        camera_enabled = self.camera_conditioning_mode != "none"
+        if camera_enabled:
+            if camera_w2cs is None or camera_intrinsics is None:
+                raise ValueError(
+                    "camera conditioning requires camera_w2cs and "
+                    "camera_intrinsics"
+                )
+            camera_w2cs, camera_intrinsics = (
+                self._prepare_camera_conditioning(
+                    camera_w2cs,
+                    camera_intrinsics,
+                    B,
+                    num_views,
+                    x.device,
+                )
+            )
+            sample_batch = B // num_views
+            if self.training and self.camera_conditioning_dropout > 0:
+                camera_keep = (
+                    torch.rand(sample_batch, 1, 1, device=x.device)
+                    >= self.camera_conditioning_dropout
+                ).to(x.dtype)
+            else:
+                camera_keep = torch.ones(
+                    sample_batch, 1, 1, device=x.device, dtype=x.dtype
+                )
+            if self.camera_rays_enabled:
+                camera_ray_patches = build_plucker_ray_patches(
+                    camera_w2cs,
+                    camera_intrinsics,
+                    H,
+                    W,
+                    self.patch_size,
+                    x.dtype,
+                )
+                camera_ray_keep = camera_keep[:, None].expand(
+                    sample_batch, num_views, 1, 1
+                )
+                if self.camera_ray_rows == "render":
+                    row_mask = camera_ray_keep.new_zeros(
+                        sample_batch, num_views, 1, 1
+                    )
+                    row_mask[:, 0] = 1
+                    camera_ray_keep = camera_ray_keep * row_mask
+                camera_ray_keep = camera_ray_keep.reshape(B, 1, 1)
+            else:
+                camera_ray_patches = None
+                camera_ray_keep = None
+        else:
+            if camera_w2cs is not None or camera_intrinsics is not None:
+                raise ValueError(
+                    "camera tensors were supplied while "
+                    "camera_conditioning_mode='none'"
+                )
+            camera_w2cs = camera_intrinsics = None
+            camera_keep = None
+            camera_ray_patches = camera_ray_keep = None
 
         pos = self.fetch_pos(Hs, Ws, x.device)
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
@@ -608,7 +999,21 @@ class PixDiT_T2I(nn.Module):
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
+                s, y_emb = self.patch_blocks[i](
+                    s,
+                    y_emb,
+                    condition,
+                    pos,
+                    pos_txt,
+                    attn_mask_joint,
+                    num_views,
+                    camera_ray_patches=camera_ray_patches,
+                    camera_ray_keep=camera_ray_keep,
+                    prope_w2cs=camera_w2cs,
+                    prope_intrinsics=camera_intrinsics,
+                    patch_grid=(Hs, Ws),
+                    camera_keep=camera_keep,
+                )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
