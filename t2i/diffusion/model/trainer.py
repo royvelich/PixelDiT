@@ -68,6 +68,7 @@ class PixDiTTrainer(nn.Module):
         patch_geometry_kwargs = {}
         depth_channel_kwargs = {}
         camera_conditioning_kwargs = {}
+        pit_attention_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -88,6 +89,13 @@ class PixDiTTrainer(nn.Module):
             depth_channel_kwargs = {
                 "depth_channel_enabled": True,
                 "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
+            }
+        if restore_cfg is not None:
+            pit_attention_kwargs = {
+                "pit_view_attention": restore_cfg.pit_view_attention,
+                "pit_camera_conditioning_mode": (
+                    restore_cfg.pit_camera_conditioning_mode
+                ),
             }
         if (
             restore_cfg is not None
@@ -127,6 +135,7 @@ class PixDiTTrainer(nn.Module):
             **patch_geometry_kwargs,
             **depth_channel_kwargs,
             **camera_conditioning_kwargs,
+            **pit_attention_kwargs,
         )
 
         self.image_size = int(image_size)

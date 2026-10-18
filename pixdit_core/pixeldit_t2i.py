@@ -529,6 +529,8 @@ class PixDiT_T2I(nn.Module):
         camera_ray_rows: str = "all",
         camera_conditioning_dropout: float = 0.0,
         prope_freq_base: float = 100.0,
+        pit_view_attention: str = "separate",
+        pit_camera_conditioning_mode: str = "none",
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -568,6 +570,30 @@ class PixDiT_T2I(nn.Module):
         self.camera_prope_enabled = self.camera_conditioning_mode in (
             "prope",
             "rays_prope",
+        )
+        self.pit_view_attention = str(pit_view_attention)
+        if self.pit_view_attention not in ("separate", "joint"):
+            raise ValueError(
+                "pit_view_attention must be separate|joint"
+            )
+        self.pit_camera_conditioning_mode = str(
+            pit_camera_conditioning_mode
+        )
+        if self.pit_camera_conditioning_mode not in (
+            "none",
+            "rays",
+            "prope",
+            "rays_prope",
+        ):
+            raise ValueError(
+                "pit_camera_conditioning_mode must be "
+                "none|rays|prope|rays_prope"
+            )
+        self.pit_camera_rays_enabled = (
+            self.pit_camera_conditioning_mode in ("rays", "rays_prope")
+        )
+        self.pit_camera_prope_enabled = (
+            self.pit_camera_conditioning_mode in ("prope", "rays_prope")
         )
         self.camera_ray_rows = str(camera_ray_rows)
         if self.camera_ray_rows not in ("all", "render"):
@@ -618,6 +644,7 @@ class PixDiT_T2I(nn.Module):
                     attn_num_heads=self.pixel_num_groups,
                     rope_fn=precompute_freqs_cis_2d,
                     adaln_post_modulation=self.pit_adaln_post_modulation,
+                    view_attention=self.pit_view_attention,
                 )
                 for _ in range(self.pixel_depth)
             ]
@@ -656,17 +683,30 @@ class PixDiT_T2I(nn.Module):
         self.last_repa_tokens = None
 
         self.initialize_weights()
-        if self.camera_conditioning_mode != "none":
+        if (
+            self.camera_conditioning_mode != "none"
+            or self.pit_camera_conditioning_mode != "none"
+        ):
             # New modules must not perturb initialization of any pre-existing
             # PixelDiT parameter. They are also zero-output at step zero.
             with torch.random.fork_rng(devices=[]):
-                for block in self.patch_blocks:
-                    block.enable_camera_conditioning(
-                        ray_patch_dim=6 * self.patch_size * self.patch_size,
-                        rays_enabled=self.camera_rays_enabled,
-                        prope_enabled=self.camera_prope_enabled,
-                        prope_freq_base=self.prope_freq_base,
-                    )
+                if self.camera_conditioning_mode != "none":
+                    for block in self.patch_blocks:
+                        block.enable_camera_conditioning(
+                            ray_patch_dim=(
+                                6 * self.patch_size * self.patch_size
+                            ),
+                            rays_enabled=self.camera_rays_enabled,
+                            prope_enabled=self.camera_prope_enabled,
+                            prope_freq_base=self.prope_freq_base,
+                        )
+                if self.pit_camera_conditioning_mode != "none":
+                    for block in self.pixel_blocks:
+                        block.enable_camera_conditioning(
+                            rays_enabled=self.pit_camera_rays_enabled,
+                            prope_enabled=self.pit_camera_prope_enabled,
+                            prope_freq_base=self.prope_freq_base,
+                        )
 
     def fetch_pos(self, height, width, device):
         if (height, width) in self.precompute_pos:
@@ -863,9 +903,11 @@ class PixDiT_T2I(nn.Module):
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
-        blocks' joint attention. Everything else -- the pixel blocks, ``final_layer``, the
-        returned shape -- treats them as independent rows, so the output stays ``[B*V,3,H,W]``
-        and the caller reshapes if it wants a view axis. ``num_views=1`` is a bit-exact no-op.
+        blocks' joint attention. Pixel blocks keep the historical independent-row path when
+        ``pit_view_attention="separate"`` and merge all views onto one attention axis when it is
+        ``"joint"``. The final layer and returned shape remain per-row, so the output stays
+        ``[B*V,3,H,W]`` and the caller reshapes if it wants a view axis. ``num_views=1`` is a
+        bit-exact no-op.
 
         ``t`` is per row (length ``B*V``); ``y`` and ``mask`` are per SAMPLE (length ``B``),
         because the text stream is shared across a sample's views.
@@ -882,7 +924,10 @@ class PixDiT_T2I(nn.Module):
             x.device,
             x.dtype,
         )
-        camera_enabled = self.camera_conditioning_mode != "none"
+        camera_enabled = (
+            self.camera_conditioning_mode != "none"
+            or self.pit_camera_conditioning_mode != "none"
+        )
         if camera_enabled:
             if camera_w2cs is None or camera_intrinsics is None:
                 raise ValueError(
@@ -908,7 +953,7 @@ class PixDiT_T2I(nn.Module):
                 camera_keep = torch.ones(
                     sample_batch, 1, 1, device=x.device, dtype=x.dtype
                 )
-            if self.camera_rays_enabled:
+            if self.camera_rays_enabled or self.pit_camera_rays_enabled:
                 camera_ray_patches = build_plucker_ray_patches(
                     camera_w2cs,
                     camera_intrinsics,
@@ -1034,7 +1079,20 @@ class PixDiT_T2I(nn.Module):
         if depth is not None:
             x_pixels = x_pixels + self._embed_pixel_depth(depth, H, W)
         for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+            x_pixels = blk(
+                x_pixels,
+                s_cond,
+                H,
+                W,
+                self.patch_size,
+                mask,
+                num_views=num_views,
+                camera_ray_patches=camera_ray_patches,
+                camera_ray_keep=camera_ray_keep,
+                prope_w2cs=camera_w2cs,
+                prope_intrinsics=camera_intrinsics,
+                camera_keep=camera_keep,
+            )
 
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels

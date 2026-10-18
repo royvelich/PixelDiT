@@ -12,10 +12,13 @@ from pixdit_core.modules import (
     RotaryAttention,
     TimestepConditioner,
     apply_adaln,
+    apply_rotary_emb,
     get_2d_sincos_pos_embed,
     get_2d_sincos_pos_embed_from_grid,
     precompute_freqs_cis_2d,
+    scaled_dot_product_attention,
 )
+from pixdit_core.prope import PropeDotProductAttention
 
 
 class PatchTokenEmbedder(nn.Module):
@@ -123,6 +126,7 @@ class PiTBlock(nn.Module):
         attn_num_heads: Optional[int] = None,
         rope_fn=None,
         adaln_post_modulation: bool = False,
+        view_attention: str = "separate",
     ):
         super().__init__()
         self.pixel_dim = int(pixel_hidden_size)
@@ -141,10 +145,55 @@ class PiTBlock(nn.Module):
         self.norm2 = RMSNorm(self.pixel_dim, eps=1e-6)
         self.mlp = MLP(self.pixel_dim, mlp_ratio=mlp_ratio, drop=0.0)
         self.adaln_post_modulation = bool(adaln_post_modulation)
+        self.view_attention = str(view_attention)
+        if self.view_attention not in ("separate", "joint"):
+            raise ValueError("PiT view_attention must be separate|joint")
         n_mod = 4 if self.adaln_post_modulation else 6
         self.adaLN_modulation = nn.Sequential(nn.Linear(self.context_dim, n_mod * self.pixel_dim * p2, bias=True))
         self._pos_cache = dict()
         self._rope_fn = rope_fn if rope_fn is not None else precompute_freqs_cis_2d
+        self.pit_ray_embedder = None
+        self.pit_prope_ref_k = None
+        self.pit_prope_ref_v = None
+        self.pit_prope_ref_k_norm = None
+        self.pit_prope_source = None
+        self.pit_prope_references = None
+
+    def enable_camera_conditioning(
+        self,
+        rays_enabled: bool,
+        prope_enabled: bool,
+        prope_freq_base: float = 100.0,
+    ) -> None:
+        """Add optional camera conditioning directly to the PiT attention path.
+
+        Rays are projected per pixel before the patch's ``P*P`` pixel features are
+        compressed into one attention token. PRoPE is an additional asymmetric
+        render-query/reference-KV residual, matching the patch-level implementation.
+        Every new output path is zero-initialized.
+        """
+        if rays_enabled and self.pit_ray_embedder is None:
+            self.pit_ray_embedder = nn.Linear(6, self.pixel_dim, bias=True)
+            nn.init.zeros_(self.pit_ray_embedder.weight)
+            nn.init.zeros_(self.pit_ray_embedder.bias)
+        if prope_enabled and self.pit_prope_ref_k is None:
+            self.pit_prope_ref_k = nn.Linear(
+                self.attn_dim, self.attn_dim, bias=True
+            )
+            self.pit_prope_ref_v = nn.Linear(
+                self.attn_dim, self.attn_dim, bias=True
+            )
+            self.pit_prope_ref_k_norm = RMSNorm(self.attn_dim // self.num_heads)
+            self.pit_prope_source = PropeDotProductAttention(
+                self.attn_dim // self.num_heads,
+                freq_base=prope_freq_base,
+            )
+            self.pit_prope_references = PropeDotProductAttention(
+                self.attn_dim // self.num_heads,
+                freq_base=prope_freq_base,
+            )
+            nn.init.zeros_(self.pit_prope_ref_v.weight)
+            nn.init.zeros_(self.pit_prope_ref_v.bias)
 
     def _fetch_pos(self, height: int, width: int, device):
         key = (height, width)
@@ -154,7 +203,234 @@ class PiTBlock(nn.Module):
         self._pos_cache[key] = pos
         return pos
 
-    def forward(self, x: torch.Tensor, s_cond: torch.Tensor, image_height: int, image_width: int, patch_size: int, mask=None) -> torch.Tensor:
+    @staticmethod
+    def _merge_views(features: torch.Tensor, num_views: int) -> torch.Tensor:
+        """``[B*V,H,L,D]`` -> ``[B,H,V*L,D]`` for joint PiT attention."""
+        if num_views == 1:
+            return features
+        batch_rows, heads, tokens, width = features.shape
+        if batch_rows % num_views:
+            raise ValueError(
+                f"PiT rows {batch_rows} are not divisible by num_views={num_views}"
+            )
+        batch = batch_rows // num_views
+        return (
+            features.view(batch, num_views, heads, tokens, width)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch, heads, num_views * tokens, width)
+        )
+
+    @staticmethod
+    def _split_views(
+        features: torch.Tensor,
+        num_views: int,
+        tokens_per_view: int,
+    ) -> torch.Tensor:
+        """Exact inverse of :meth:`_merge_views`."""
+        if num_views == 1:
+            return features
+        batch, heads, all_tokens, width = features.shape
+        if all_tokens != num_views * tokens_per_view:
+            raise ValueError(
+                f"PiT token axis {all_tokens} != "
+                f"num_views {num_views} * tokens {tokens_per_view}"
+            )
+        return (
+            features.view(
+                batch, heads, num_views, tokens_per_view, width
+            )
+            .permute(0, 2, 1, 3, 4)
+            .reshape(
+                batch * num_views, heads, tokens_per_view, width
+            )
+        )
+
+    def _prope_reference_attention(
+        self,
+        x: torch.Tensor,
+        render_query: torch.Tensor,
+        num_views: int,
+        viewmats: torch.Tensor,
+        intrinsics: torch.Tensor,
+        patch_grid,
+        camera_keep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Return a PRoPE residual on render rows; reference rows stay zero."""
+        if num_views <= 1:
+            return torch.zeros_like(x)
+        batch_rows, tokens, channels = x.shape
+        if batch_rows % num_views:
+            raise ValueError(
+                f"PiT rows {batch_rows} are not divisible by num_views={num_views}"
+            )
+        batch = batch_rows // num_views
+        if viewmats.shape != (batch, num_views, 4, 4):
+            raise ValueError(
+                "PiT PRoPE view matrices must be "
+                f"{(batch, num_views, 4, 4)}, got {tuple(viewmats.shape)}"
+            )
+        if intrinsics.shape != (batch, num_views, 3, 3):
+            raise ValueError(
+                "PiT PRoPE intrinsics must be "
+                f"{(batch, num_views, 3, 3)}, got {tuple(intrinsics.shape)}"
+            )
+        if patch_grid is None or len(patch_grid) != 2:
+            raise ValueError("PiT PRoPE requires a patch grid")
+        patch_height, patch_width = (int(value) for value in patch_grid)
+        if patch_height * patch_width != tokens:
+            raise ValueError(
+                f"PiT patch grid {(patch_height, patch_width)} has "
+                f"{patch_height * patch_width} tokens, expected {tokens}"
+            )
+
+        num_refs = num_views - 1
+        references = x.view(batch, num_views, tokens, channels)[:, 1:]
+        key = self.pit_prope_ref_k(references).view(
+            batch,
+            num_refs,
+            tokens,
+            self.num_heads,
+            self.attn_dim // self.num_heads,
+        )
+        value = self.pit_prope_ref_v(references).view(
+            batch,
+            num_refs,
+            tokens,
+            self.num_heads,
+            self.attn_dim // self.num_heads,
+        )
+        key = self.pit_prope_ref_k_norm(key)
+        key = key.permute(0, 3, 1, 2, 4).reshape(
+            batch,
+            self.num_heads,
+            num_refs * tokens,
+            self.attn_dim // self.num_heads,
+        )
+        value = value.permute(0, 3, 1, 2, 4).reshape_as(key)
+        query = (
+            render_query.view(
+                batch,
+                num_views,
+                tokens,
+                self.num_heads,
+                self.attn_dim // self.num_heads,
+            )[:, 0]
+            .permute(0, 2, 1, 3)
+        )
+
+        self.pit_prope_source.update_coeffs(
+            patch_width, patch_height, query.device
+        )
+        self.pit_prope_references.update_coeffs(
+            patch_width, patch_height, query.device
+        )
+        self.pit_prope_source.prepare(viewmats[:, :1], intrinsics[:, :1])
+        self.pit_prope_references.prepare(
+            viewmats[:, 1:], intrinsics[:, 1:]
+        )
+
+        attention_dtype = query.dtype
+        query = self.pit_prope_source.apply_to_q(query).to(attention_dtype)
+        key = self.pit_prope_references.apply_to_kv(key).to(attention_dtype)
+        value = self.pit_prope_references.apply_to_kv(value).to(
+            attention_dtype
+        )
+        output = scaled_dot_product_attention(
+            query, key, value, dropout_p=0.0
+        )
+        output = self.pit_prope_source.apply_to_output(output).to(
+            attention_dtype
+        )
+        output = output.transpose(1, 2).reshape(batch, tokens, channels)
+        if camera_keep is not None:
+            if camera_keep.shape != (batch, 1, 1):
+                raise ValueError(
+                    "PiT camera_keep must be "
+                    f"{(batch, 1, 1)}, got {tuple(camera_keep.shape)}"
+                )
+            output = output * camera_keep.to(output.dtype)
+        zeros = output.new_zeros(batch, num_refs, tokens, channels)
+        return torch.cat([output[:, None], zeros], dim=1).reshape_as(x)
+
+    def _attention(
+        self,
+        x: torch.Tensor,
+        pos,
+        mask,
+        num_views: int,
+        prope_w2cs: Optional[torch.Tensor],
+        prope_intrinsics: Optional[torch.Tensor],
+        patch_grid,
+        camera_keep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the original per-view or the optional joint-view PiT attention."""
+        batch_rows, tokens, channels = x.shape
+        head_dim = channels // self.num_heads
+        qkv = (
+            self.attn.qkv(x)
+            .reshape(
+                batch_rows, tokens, 3, self.num_heads, head_dim
+            )
+            .permute(2, 0, 1, 3, 4)
+        )
+        query, key, value = qkv[0], qkv[1], qkv[2]
+        query = self.attn.q_norm(query)
+        key = self.attn.k_norm(key)
+        render_query = query
+        query, key = apply_rotary_emb(query, key, freqs_cis=pos)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
+
+        if self.view_attention == "joint" and num_views > 1:
+            if mask is not None:
+                raise ValueError(
+                    "joint PiT attention does not support a per-view mask"
+                )
+            query = self._merge_views(query, num_views)
+            key = self._merge_views(key, num_views)
+            value = self._merge_views(value, num_views)
+        output = scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, dropout_p=0.0
+        )
+        if self.view_attention == "joint" and num_views > 1:
+            output = self._split_views(output, num_views, tokens)
+        output = output.transpose(1, 2).reshape(
+            batch_rows, tokens, channels
+        )
+
+        if self.pit_prope_ref_k is not None:
+            if prope_w2cs is None or prope_intrinsics is None:
+                raise ValueError(
+                    "PiT PRoPE reference attention requires camera matrices"
+                )
+            output = output + self._prope_reference_attention(
+                x,
+                render_query,
+                num_views,
+                prope_w2cs,
+                prope_intrinsics,
+                patch_grid,
+                camera_keep,
+            )
+        output = self.attn.proj(output)
+        return self.attn.proj_drop(output)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        s_cond: torch.Tensor,
+        image_height: int,
+        image_width: int,
+        patch_size: int,
+        mask=None,
+        num_views: int = 1,
+        camera_ray_patches: Optional[torch.Tensor] = None,
+        camera_ray_keep: Optional[torch.Tensor] = None,
+        prope_w2cs: Optional[torch.Tensor] = None,
+        prope_intrinsics: Optional[torch.Tensor] = None,
+        camera_keep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         BL, P2, C = x.shape
         if C != self.pixel_dim:
             raise ValueError(f"PiTBlock expected pixel_dim={self.pixel_dim}, got {C}")
@@ -162,6 +438,12 @@ class PiTBlock(nn.Module):
         Hs, Ws = image_height // patch_size, image_width // patch_size
         L = Hs * Ws
         B = BL // L
+        if BL != B * L:
+            raise ValueError(f"PiT pixel rows {BL} are not divisible by L={L}")
+        if B % num_views:
+            raise ValueError(
+                f"PiT image rows {B} are not divisible by num_views={num_views}"
+            )
         n_mod = 4 if self.adaln_post_modulation else 6
         cond_params = self.adaLN_modulation(s_cond).view(BL, P2, n_mod * self.pixel_dim)
         if self.adaln_post_modulation:
@@ -170,10 +452,46 @@ class PiTBlock(nn.Module):
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(cond_params, 6, dim=-1)
             x_norm = apply_adaln(self.norm1(x), shift_msa, scale_msa)
+        if self.pit_ray_embedder is not None:
+            if camera_ray_patches is None:
+                raise ValueError(
+                    "PiT ray conditioning requires camera_ray_patches"
+                )
+            expected = (B, L, 6 * P2)
+            if camera_ray_patches.shape != expected:
+                raise ValueError(
+                    "PiT camera ray patches must be "
+                    f"{expected}, got {tuple(camera_ray_patches.shape)}"
+                )
+            ray_pixels = (
+                camera_ray_patches.view(B, L, 6, P2)
+                .permute(0, 1, 3, 2)
+                .reshape(BL, P2, 6)
+            )
+            ray_embedding = self.pit_ray_embedder(ray_pixels)
+            if camera_ray_keep is not None:
+                if camera_ray_keep.shape != (B, 1, 1):
+                    raise ValueError(
+                        "PiT camera_ray_keep must be "
+                        f"{(B, 1, 1)}, got {tuple(camera_ray_keep.shape)}"
+                    )
+                ray_embedding = ray_embedding * camera_ray_keep.repeat_interleave(
+                    L, dim=0
+                ).to(ray_embedding.dtype)
+            x_norm = x_norm + ray_embedding
         x_flat = x_norm.view(BL, P2 * self.pixel_dim)
         x_comp = self.compress_to_attn(x_flat).view(B, L, self.attn_dim)
         pos_comp = self._fetch_pos(Hs, Ws, x.device)
-        attn_out = self.attn(x_comp, pos_comp, mask)
+        attn_out = self._attention(
+            x_comp,
+            pos_comp,
+            mask,
+            num_views,
+            prope_w2cs,
+            prope_intrinsics,
+            (Hs, Ws),
+            camera_keep,
+        )
         attn_flat = self.expand_from_attn(attn_out.view(B * L, self.attn_dim))
         attn_exp = attn_flat.view(BL, P2, self.pixel_dim)
         if self.adaln_post_modulation:
