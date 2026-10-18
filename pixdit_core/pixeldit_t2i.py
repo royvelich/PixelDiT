@@ -15,6 +15,7 @@ from .modules import (
     precompute_freqs_cis_2d,
 )
 from .prope import PropeDotProductAttention, invert_se3
+from .rayrope import RayRoPEEncoding, apply_rayrope
 
 
 def merge_views(t: torch.Tensor, num_views: int) -> torch.Tensor:
@@ -200,6 +201,11 @@ class MMDiTJointAttention(nn.Module):
         self.prope_ref_k_norm = None
         self.prope_source = None
         self.prope_references = None
+        self.rayrope_encoding = None
+        self.rayrope_depth_proj = None
+        self.rayrope_score_gate = None
+        self.rayrope_value_gate = None
+        self.rayrope_dim = None
 
     def enable_prope_reference_attention(self, freq_base: float = 100.0) -> None:
         """Add ArtiFixer-style render-query/reference-KV attention."""
@@ -216,6 +222,250 @@ class MMDiTJointAttention(nn.Module):
         )
         nn.init.zeros_(self.prope_ref_v.weight)
         nn.init.zeros_(self.prope_ref_v.bias)
+
+    def enable_rayrope_attention(
+        self,
+        rayrope_dim: int = 48,
+        pos_enc_type: str = "d_pj+0_3d",
+        num_rays_per_patch: int = 3,
+        depth_type: str = "predict_dsig",
+        denc_type: str = "d",
+        freq_base: float = 3.0,
+        apply_vo: bool = True,
+        init_depth: float = 0.0,
+        init_sigma: float = 3.0,
+        score_gate_init: float = 0.0,
+        value_gate_init: float = 0.0,
+    ) -> None:
+        """Add the paper RayRoPE channels alongside PixelDiT's 2D-RoPE head.
+
+        The first ``rayrope_dim`` pretrained Q/K/V channels are reused as the
+        additional RayRoPE channels. This is the requested 64+48 construction
+        without a large randomly initialized projection. Two per-head gates
+        start at zero, making the new path an initial no-op.
+        """
+        if self.rayrope_encoding is not None:
+            return
+        rayrope_dim = int(rayrope_dim)
+        if rayrope_dim > self.head_dim:
+            raise ValueError(
+                f"rayrope_dim={rayrope_dim} exceeds head_dim={self.head_dim}"
+            )
+        self.rayrope_dim = rayrope_dim
+        self.rayrope_encoding = RayRoPEEncoding(
+            head_dim=rayrope_dim,
+            pos_enc_type=pos_enc_type,
+            num_rays_per_patch=num_rays_per_patch,
+            depth_type=depth_type,
+            denc_type=denc_type,
+            freq_base=freq_base,
+            apply_vo=apply_vo,
+        )
+        self.rayrope_depth_proj = nn.Linear(self.dim, 2, bias=True)
+        nn.init.zeros_(self.rayrope_depth_proj.weight)
+        with torch.no_grad():
+            self.rayrope_depth_proj.bias.copy_(
+                torch.tensor(
+                    [float(init_depth), float(init_sigma)],
+                    dtype=self.rayrope_depth_proj.bias.dtype,
+                )
+            )
+        self.rayrope_score_gate = nn.Parameter(
+            torch.full((self.num_heads,), float(score_gate_init))
+        )
+        self.rayrope_value_gate = nn.Parameter(
+            torch.full((self.num_heads,), float(value_gate_init))
+        )
+
+    def _rayrope_joint_attention(
+        self,
+        x: torch.Tensor,
+        query_base_image: torch.Tensor,
+        key_base_image: torch.Tensor,
+        value_base_image: torch.Tensor,
+        query_ray_image: torch.Tensor,
+        key_ray_image: torch.Tensor,
+        value_ray_image: torch.Tensor,
+        query_text: torch.Tensor,
+        key_text: torch.Tensor,
+        value_text: torch.Tensor,
+        num_views: int,
+        viewmats: torch.Tensor,
+        intrinsics: torch.Tensor,
+        patch_grid,
+        camera_keep: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One shared softmax over 2D-RoPE and official RayRoPE channels."""
+        batch_rows, tokens, channels = x.shape
+        if batch_rows % num_views:
+            raise ValueError(
+                f"image rows {batch_rows} are not divisible by "
+                f"num_views={num_views}"
+            )
+        batch = batch_rows // num_views
+        if viewmats.shape != (batch, num_views, 4, 4):
+            raise ValueError(
+                "RayRoPE view matrices must be "
+                f"{(batch, num_views, 4, 4)}, got {tuple(viewmats.shape)}"
+            )
+        if intrinsics.shape != (batch, num_views, 3, 3):
+            raise ValueError(
+                "RayRoPE intrinsics must be "
+                f"{(batch, num_views, 3, 3)}, got {tuple(intrinsics.shape)}"
+            )
+        if patch_grid is None or len(patch_grid) != 2:
+            raise ValueError("RayRoPE attention requires a patch grid")
+        patch_height, patch_width = (int(value) for value in patch_grid)
+        if patch_height * patch_width != tokens:
+            raise ValueError(
+                f"patch grid {(patch_height, patch_width)} has "
+                f"{patch_height * patch_width} tokens, expected {tokens}"
+            )
+
+        ray_dim = self.rayrope_dim
+        base_dim = self.head_dim
+        query_ray = merge_views(
+            query_ray_image[..., :ray_dim].transpose(1, 2), num_views
+        )
+        key_ray = merge_views(
+            key_ray_image[..., :ray_dim].transpose(1, 2), num_views
+        )
+        value_ray = merge_views(
+            value_ray_image[..., :ray_dim].transpose(1, 2), num_views
+        )
+        query_base = merge_views(query_base_image, num_views)
+        key_base = merge_views(key_base_image, num_views)
+        value_base = merge_views(value_base_image, num_views)
+
+        text_on = query_text is not None
+        if text_on:
+            text_tokens = query_text.shape[2]
+            key_joint = torch.cat([key_text, key_base], dim=2)
+            value_joint = torch.cat([value_text, value_base], dim=2)
+        else:
+            text_tokens = 0
+            key_joint = key_base
+            value_joint = value_base
+
+        predicted_depth = self.rayrope_depth_proj(x).view(
+            batch, num_views, tokens, 2
+        ).reshape(batch, num_views * tokens, 2)
+        coefficients = self.rayrope_encoding.prepare_coefficients(
+            viewmats,
+            intrinsics,
+            predicted_depth,
+            (patch_height, patch_width),
+        )
+        attention_dtype = query_base.dtype
+        query_ray = apply_rayrope(
+            query_ray.float(),
+            coefficients.query_cos,
+            coefficients.query_sin,
+            inverse=True,
+        ).to(attention_dtype)
+
+        score_gate = self.rayrope_score_gate.view(
+            1, self.num_heads, 1, 1
+        ).to(attention_dtype)
+        value_gate = self.rayrope_value_gate.view(
+            1, self.num_heads, 1, 1
+        ).to(attention_dtype)
+        if camera_keep is not None:
+            if camera_keep.shape != (batch, 1, 1):
+                raise ValueError(
+                    f"camera_keep must be {(batch, 1, 1)}, got "
+                    f"{tuple(camera_keep.shape)}"
+                )
+            keep = camera_keep.view(batch, 1, 1, 1).to(attention_dtype)
+            score_gate = score_gate * keep
+            value_gate = value_gate * keep
+
+        # SDPA normally divides by sqrt(64+48). Scaling Q restores the
+        # pretrained 1/sqrt(64) content score. The RayRoPE Q scale separately
+        # gives its geometric dot product the natural 1/sqrt(48) scale.
+        augmented_query_scale = (
+            float(base_dim + ray_dim) / float(base_dim)
+        ) ** 0.5
+        ray_score_scale = (float(base_dim) / float(ray_dim)) ** 0.5
+        output_views = []
+        for camera_index in range(num_views):
+            start = camera_index * tokens
+            end = start + tokens
+            key_ray_camera = apply_rayrope(
+                key_ray.float(),
+                coefficients.key_value_cos[camera_index],
+                coefficients.key_value_sin[camera_index],
+                inverse=True,
+            ).to(attention_dtype)
+            value_ray_camera = apply_rayrope(
+                value_ray.float(),
+                coefficients.key_value_cos[camera_index],
+                coefficients.key_value_sin[camera_index],
+                inverse=True,
+            ).to(attention_dtype)
+            if text_on:
+                ray_zeros = key_ray_camera.new_zeros(
+                    batch, self.num_heads, text_tokens, ray_dim
+                )
+                key_ray_joint = torch.cat(
+                    [ray_zeros, key_ray_camera], dim=2
+                )
+                value_ray_joint = torch.cat(
+                    [ray_zeros, value_ray_camera], dim=2
+                )
+            else:
+                key_ray_joint = key_ray_camera
+                value_ray_joint = value_ray_camera
+
+            query_augmented = torch.cat(
+                [
+                    query_base[:, :, start:end],
+                    query_ray[:, :, start:end]
+                    * score_gate
+                    * ray_score_scale,
+                ],
+                dim=-1,
+            )
+            key_augmented = torch.cat(
+                [key_joint, key_ray_joint], dim=-1
+            )
+            value_augmented = torch.cat(
+                [value_joint, value_ray_joint], dim=-1
+            )
+            output_augmented = F.scaled_dot_product_attention(
+                query_augmented * augmented_query_scale,
+                key_augmented,
+                value_augmented,
+                dropout_p=0.0,
+                attn_mask=attn_mask,
+            )
+            output_base = output_augmented[..., :base_dim]
+            output_ray = apply_rayrope(
+                output_augmented[..., base_dim:].float(),
+                coefficients.query_cos[:, start:end],
+                coefficients.query_sin[:, start:end],
+                inverse=False,
+            ).to(attention_dtype)
+            output_base = output_base + F.pad(
+                output_ray * value_gate,
+                (0, base_dim - ray_dim),
+            )
+            output_views.append(output_base)
+
+        output_image = torch.cat(output_views, dim=2)
+        output_image = split_views(output_image, num_views, tokens)
+
+        if not text_on:
+            return output_image, None
+        output_text = F.scaled_dot_product_attention(
+            query_text,
+            key_joint,
+            value_joint,
+            dropout_p=0.0,
+            attn_mask=attn_mask,
+        )
+        return output_image, output_text
 
     def _prope_reference_attention(
         self,
@@ -337,6 +587,9 @@ class MMDiTJointAttention(nn.Module):
         qx = self.q_norm_x(qx)
         kx = self.k_norm_x(kx)
         render_query = qx
+        rayrope_query = qx
+        rayrope_key = kx
+        rayrope_value = vx
 
         # Note the batch: image tokens are at B (== B*V), text at By. Using B here would be a
         # shape error at V>1 and a silent no-op at V=1.
@@ -359,23 +612,52 @@ class MMDiTJointAttention(nn.Module):
             ky = ky.transpose(1, 2)
             vy = vy.transpose(1, 2)
 
-        # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so each view must get
-        # the same positional phase. Merging first would be identical here, but doing it last
-        # keeps the invariant obvious.
-        qx = merge_views(qx, num_views)
-        kx = merge_views(kx, num_views)
-        vx = merge_views(vx, num_views)
-
-        if text_on:
-            q_joint = torch.cat([qy, qx], dim=2)
-            k_joint = torch.cat([ky, kx], dim=2)
-            v_joint = torch.cat([vy, vx], dim=2)
+        if self.rayrope_encoding is not None:
+            if prope_w2cs is None or prope_intrinsics is None:
+                raise ValueError("RayRoPE attention requires camera matrices")
+            out_x, out_y = self._rayrope_joint_attention(
+                x,
+                qx,
+                kx,
+                vx,
+                rayrope_query,
+                rayrope_key,
+                rayrope_value,
+                qy if text_on else None,
+                ky if text_on else None,
+                vy if text_on else None,
+                num_views,
+                prope_w2cs,
+                prope_intrinsics,
+                patch_grid,
+                camera_keep,
+                attn_mask,
+            )
         else:
-            q_joint, k_joint, v_joint = qx, kx, vx
+            # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so
+            # each view gets the same positional phase.
+            qx = merge_views(qx, num_views)
+            kx = merge_views(kx, num_views)
+            vx = merge_views(vx, num_views)
+            if text_on:
+                q_joint = torch.cat([qy, qx], dim=2)
+                k_joint = torch.cat([ky, kx], dim=2)
+                v_joint = torch.cat([vy, vx], dim=2)
+            else:
+                q_joint, k_joint, v_joint = qx, kx, vx
+            out_joint = F.scaled_dot_product_attention(
+                q_joint,
+                k_joint,
+                v_joint,
+                dropout_p=0.0,
+                attn_mask=attn_mask,
+            )
+            n_txt = Ny if text_on else 0
+            out_x = split_views(
+                out_joint[:, :, n_txt:, :], num_views, Nx
+            )
+            out_y = out_joint[:, :, :Ny, :] if text_on else None
 
-        out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
-        n_txt = Ny if text_on else 0
-        out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
         out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
         if self.prope_ref_k is not None:
             if prope_w2cs is None or prope_intrinsics is None:
@@ -395,7 +677,7 @@ class MMDiTJointAttention(nn.Module):
 
         if not text_on:
             return out_x, None
-        out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(By, Ny, C)
+        out_y = out_y.transpose(1, 2).reshape(By, Ny, C)
         out_y = self.proj_drop_y(self.proj_y(out_y))
         return out_x, out_y
 
@@ -429,6 +711,18 @@ class MMDiTBlockT2I(nn.Module):
         rays_enabled: bool,
         prope_enabled: bool,
         prope_freq_base: float,
+        rayrope_enabled: bool = False,
+        rayrope_dim: int = 48,
+        rayrope_pos_enc_type: str = "d_pj+0_3d",
+        rayrope_num_rays_per_patch: int = 3,
+        rayrope_depth_type: str = "predict_dsig",
+        rayrope_denc_type: str = "d",
+        rayrope_freq_base: float = 3.0,
+        rayrope_apply_vo: bool = True,
+        rayrope_init_depth: float = 0.0,
+        rayrope_init_sigma: float = 3.0,
+        rayrope_score_gate_init: float = 0.0,
+        rayrope_value_gate_init: float = 0.0,
     ) -> None:
         if rays_enabled:
             self.camera_ray_embedder = nn.Linear(
@@ -438,6 +732,20 @@ class MMDiTBlockT2I(nn.Module):
             nn.init.zeros_(self.camera_ray_embedder.bias)
         if prope_enabled:
             self.attn.enable_prope_reference_attention(prope_freq_base)
+        if rayrope_enabled:
+            self.attn.enable_rayrope_attention(
+                rayrope_dim=rayrope_dim,
+                pos_enc_type=rayrope_pos_enc_type,
+                num_rays_per_patch=rayrope_num_rays_per_patch,
+                depth_type=rayrope_depth_type,
+                denc_type=rayrope_denc_type,
+                freq_base=rayrope_freq_base,
+                apply_vo=rayrope_apply_vo,
+                init_depth=rayrope_init_depth,
+                init_sigma=rayrope_init_sigma,
+                score_gate_init=rayrope_score_gate_init,
+                value_gate_init=rayrope_value_gate_init,
+            )
 
     def forward(
         self,
@@ -529,6 +837,17 @@ class PixDiT_T2I(nn.Module):
         camera_ray_rows: str = "all",
         camera_conditioning_dropout: float = 0.0,
         prope_freq_base: float = 100.0,
+        rayrope_dim: int = 48,
+        rayrope_pos_enc_type: str = "d_pj+0_3d",
+        rayrope_num_rays_per_patch: int = 3,
+        rayrope_depth_type: str = "predict_dsig",
+        rayrope_denc_type: str = "d",
+        rayrope_freq_base: float = 3.0,
+        rayrope_apply_vo: bool = True,
+        rayrope_init_depth: float = 0.0,
+        rayrope_init_sigma: float = 3.0,
+        rayrope_score_gate_init: float = 0.0,
+        rayrope_value_gate_init: float = 0.0,
         pit_view_attention: str = "separate",
         pit_camera_conditioning_mode: str = "none",
     ):
@@ -558,18 +877,25 @@ class PixDiT_T2I(nn.Module):
             "rays",
             "prope",
             "rays_prope",
+            "rayrope",
+            "rays_rayrope",
         ):
             raise ValueError(
                 "camera_conditioning_mode must be "
-                "none|rays|prope|rays_prope"
+                "none|rays|prope|rays_prope|rayrope|rays_rayrope"
             )
         self.camera_rays_enabled = self.camera_conditioning_mode in (
             "rays",
             "rays_prope",
+            "rays_rayrope",
         )
         self.camera_prope_enabled = self.camera_conditioning_mode in (
             "prope",
             "rays_prope",
+        )
+        self.camera_rayrope_enabled = self.camera_conditioning_mode in (
+            "rayrope",
+            "rays_rayrope",
         )
         self.pit_view_attention = str(pit_view_attention)
         if self.pit_view_attention not in ("separate", "joint"):
@@ -604,6 +930,17 @@ class PixDiT_T2I(nn.Module):
         self.prope_freq_base = float(prope_freq_base)
         if self.prope_freq_base <= 0:
             raise ValueError("prope_freq_base must be positive")
+        self.rayrope_dim = int(rayrope_dim)
+        self.rayrope_pos_enc_type = str(rayrope_pos_enc_type)
+        self.rayrope_num_rays_per_patch = int(rayrope_num_rays_per_patch)
+        self.rayrope_depth_type = str(rayrope_depth_type)
+        self.rayrope_denc_type = str(rayrope_denc_type)
+        self.rayrope_freq_base = float(rayrope_freq_base)
+        self.rayrope_apply_vo = bool(rayrope_apply_vo)
+        self.rayrope_init_depth = float(rayrope_init_depth)
+        self.rayrope_init_sigma = float(rayrope_init_sigma)
+        self.rayrope_score_gate_init = float(rayrope_score_gate_init)
+        self.rayrope_value_gate_init = float(rayrope_value_gate_init)
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
             raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
@@ -699,6 +1036,24 @@ class PixDiT_T2I(nn.Module):
                             rays_enabled=self.camera_rays_enabled,
                             prope_enabled=self.camera_prope_enabled,
                             prope_freq_base=self.prope_freq_base,
+                            rayrope_enabled=self.camera_rayrope_enabled,
+                            rayrope_dim=self.rayrope_dim,
+                            rayrope_pos_enc_type=self.rayrope_pos_enc_type,
+                            rayrope_num_rays_per_patch=(
+                                self.rayrope_num_rays_per_patch
+                            ),
+                            rayrope_depth_type=self.rayrope_depth_type,
+                            rayrope_denc_type=self.rayrope_denc_type,
+                            rayrope_freq_base=self.rayrope_freq_base,
+                            rayrope_apply_vo=self.rayrope_apply_vo,
+                            rayrope_init_depth=self.rayrope_init_depth,
+                            rayrope_init_sigma=self.rayrope_init_sigma,
+                            rayrope_score_gate_init=(
+                                self.rayrope_score_gate_init
+                            ),
+                            rayrope_value_gate_init=(
+                                self.rayrope_value_gate_init
+                            ),
                         )
                 if self.pit_camera_conditioning_mode != "none":
                     for block in self.pixel_blocks:

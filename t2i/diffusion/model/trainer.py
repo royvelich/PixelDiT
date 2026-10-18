@@ -110,6 +110,25 @@ class PixDiTTrainer(nn.Module):
                     restore_cfg.camera_conditioning_dropout
                 ),
                 "prope_freq_base": restore_cfg.prope_freq_base,
+                "rayrope_dim": restore_cfg.rayrope_dim,
+                "rayrope_pos_enc_type": (
+                    restore_cfg.rayrope_pos_enc_type
+                ),
+                "rayrope_num_rays_per_patch": (
+                    restore_cfg.rayrope_num_rays_per_patch
+                ),
+                "rayrope_depth_type": restore_cfg.rayrope_depth_type,
+                "rayrope_denc_type": restore_cfg.rayrope_denc_type,
+                "rayrope_freq_base": restore_cfg.rayrope_freq_base,
+                "rayrope_apply_vo": restore_cfg.rayrope_apply_vo,
+                "rayrope_init_depth": restore_cfg.rayrope_init_depth,
+                "rayrope_init_sigma": restore_cfg.rayrope_init_sigma,
+                "rayrope_score_gate_init": (
+                    restore_cfg.rayrope_score_gate_init
+                ),
+                "rayrope_value_gate_init": (
+                    restore_cfg.rayrope_value_gate_init
+                ),
             }
 
         if PixDiT_T2I is None:
