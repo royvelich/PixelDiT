@@ -96,6 +96,7 @@ class PixDiTTrainer(nn.Module):
                 "pit_camera_conditioning_mode": (
                     restore_cfg.pit_camera_conditioning_mode
                 ),
+                "pit_reference_flow": restore_cfg.pit_reference_flow,
             }
         if (
             restore_cfg is not None

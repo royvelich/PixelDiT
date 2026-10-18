@@ -850,6 +850,7 @@ class PixDiT_T2I(nn.Module):
         rayrope_value_gate_init: float = 0.0,
         pit_view_attention: str = "separate",
         pit_camera_conditioning_mode: str = "none",
+        pit_reference_flow: bool = True,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -921,6 +922,7 @@ class PixDiT_T2I(nn.Module):
         self.pit_camera_prope_enabled = (
             self.pit_camera_conditioning_mode in ("prope", "rays_prope")
         )
+        self.pit_reference_flow = bool(pit_reference_flow)
         self.camera_ray_rows = str(camera_ray_rows)
         if self.camera_ray_rows not in ("all", "render"):
             raise ValueError("camera_ray_rows must be all|render")
@@ -1434,20 +1436,84 @@ class PixDiT_T2I(nn.Module):
         if depth is not None:
             x_pixels = x_pixels + self._embed_pixel_depth(depth, H, W)
         for blk in self.pixel_blocks:
-            x_pixels = blk(
-                x_pixels,
-                s_cond,
+            if self.pit_reference_flow or num_views == 1:
+                x_pixels = blk(
+                    x_pixels,
+                    s_cond,
+                    H,
+                    W,
+                    self.patch_size,
+                    mask,
+                    num_views=num_views,
+                    camera_ray_patches=camera_ray_patches,
+                    camera_ray_keep=camera_ray_keep,
+                    prope_w2cs=camera_w2cs,
+                    prope_intrinsics=camera_intrinsics,
+                    camera_keep=camera_keep,
+                )
+                continue
+
+            # The DiT path still evolves every view jointly. Only the PiT path
+            # is render-only: reference pixel tokens bypass all PiT blocks
+            # unchanged, while the render keeps its own DiT patch conditioning.
+            sample_batch = B // num_views
+            pixel_shape = x_pixels.shape[1:]
+            pixel_views = x_pixels.view(
+                sample_batch, num_views, L, *pixel_shape
+            )
+            render_pixels = pixel_views[:, 0].reshape(
+                sample_batch * L, *pixel_shape
+            )
+            condition_views = s_cond.view(
+                sample_batch, num_views, L, self.hidden_size
+            )
+            render_condition = condition_views[:, 0].reshape(
+                sample_batch * L, self.hidden_size
+            )
+            render_ray_patches = None
+            if camera_ray_patches is not None:
+                render_ray_patches = camera_ray_patches.view(
+                    sample_batch,
+                    num_views,
+                    L,
+                    camera_ray_patches.shape[-1],
+                )[:, 0]
+            render_ray_keep = None
+            if camera_ray_keep is not None:
+                render_ray_keep = camera_ray_keep.view(
+                    sample_batch, num_views, 1, 1
+                )[:, 0]
+            render_pixels = blk(
+                render_pixels,
+                render_condition,
                 H,
                 W,
                 self.patch_size,
                 mask,
-                num_views=num_views,
-                camera_ray_patches=camera_ray_patches,
-                camera_ray_keep=camera_ray_keep,
-                prope_w2cs=camera_w2cs,
-                prope_intrinsics=camera_intrinsics,
+                num_views=1,
+                camera_ray_patches=render_ray_patches,
+                camera_ray_keep=render_ray_keep,
+                prope_w2cs=(
+                    camera_w2cs[:, :1]
+                    if camera_w2cs is not None
+                    else None
+                ),
+                prope_intrinsics=(
+                    camera_intrinsics[:, :1]
+                    if camera_intrinsics is not None
+                    else None
+                ),
                 camera_keep=camera_keep,
             )
+            x_pixels = torch.cat(
+                [
+                    render_pixels.view(
+                        sample_batch, 1, L, *pixel_shape
+                    ),
+                    pixel_views[:, 1:],
+                ],
+                dim=1,
+            ).reshape(B * L, *pixel_shape)
 
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels
