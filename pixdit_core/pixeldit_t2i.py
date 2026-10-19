@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -206,6 +208,7 @@ class MMDiTJointAttention(nn.Module):
         self.rayrope_score_gate = None
         self.rayrope_value_gate = None
         self.rayrope_dim = None
+        self.rayrope_depth_type = None
 
     def enable_prope_reference_attention(self, freq_base: float = 100.0) -> None:
         """Add ArtiFixer-style render-query/reference-KV attention."""
@@ -252,6 +255,7 @@ class MMDiTJointAttention(nn.Module):
                 f"rayrope_dim={rayrope_dim} exceeds head_dim={self.head_dim}"
             )
         self.rayrope_dim = rayrope_dim
+        self.rayrope_depth_type = str(depth_type)
         self.rayrope_encoding = RayRoPEEncoding(
             head_dim=rayrope_dim,
             pos_enc_type=pos_enc_type,
@@ -261,15 +265,16 @@ class MMDiTJointAttention(nn.Module):
             freq_base=freq_base,
             apply_vo=apply_vo,
         )
-        self.rayrope_depth_proj = nn.Linear(self.dim, 2, bias=True)
-        nn.init.zeros_(self.rayrope_depth_proj.weight)
-        with torch.no_grad():
-            self.rayrope_depth_proj.bias.copy_(
-                torch.tensor(
-                    [float(init_depth), float(init_sigma)],
-                    dtype=self.rayrope_depth_proj.bias.dtype,
+        if self.rayrope_depth_type == "predict_dsig":
+            self.rayrope_depth_proj = nn.Linear(self.dim, 2, bias=True)
+            nn.init.zeros_(self.rayrope_depth_proj.weight)
+            with torch.no_grad():
+                self.rayrope_depth_proj.bias.copy_(
+                    torch.tensor(
+                        [float(init_depth), float(init_sigma)],
+                        dtype=self.rayrope_depth_proj.bias.dtype,
+                    )
                 )
-            )
         self.rayrope_score_gate = nn.Parameter(
             torch.full((self.num_heads,), float(score_gate_init))
         )
@@ -295,6 +300,9 @@ class MMDiTJointAttention(nn.Module):
         patch_grid,
         camera_keep: torch.Tensor,
         attn_mask: torch.Tensor,
+        rayrope_depth: torch.Tensor = None,
+        rayrope_depth_validity: torch.Tensor = None,
+        reference_logit_count_correction: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """One shared softmax over 2D-RoPE and official RayRoPE channels."""
         batch_rows, tokens, channels = x.shape
@@ -348,9 +356,53 @@ class MMDiTJointAttention(nn.Module):
             key_joint = key_base
             value_joint = value_base
 
-        predicted_depth = self.rayrope_depth_proj(x).view(
-            batch, num_views, tokens, 2
-        ).reshape(batch, num_views * tokens, 2)
+        if self.rayrope_depth_type == "cached_gs":
+            expected_depth = (batch, num_views, tokens)
+            if (
+                rayrope_depth is None
+                or tuple(rayrope_depth.shape) != expected_depth
+            ):
+                raise ValueError(
+                    "cached-GS RayRoPE depth must be "
+                    f"{expected_depth}, got "
+                    f"{None if rayrope_depth is None else tuple(rayrope_depth.shape)}"
+                )
+            if (
+                rayrope_depth_validity is None
+                or tuple(rayrope_depth_validity.shape) != expected_depth
+            ):
+                raise ValueError(
+                    "cached-GS RayRoPE validity must be "
+                    f"{expected_depth}, got "
+                    f"{None if rayrope_depth_validity is None else tuple(rayrope_depth_validity.shape)}"
+                )
+            rayrope_depth = rayrope_depth.to(
+                device=x.device,
+                dtype=torch.float32,
+            )
+            rayrope_depth_validity = rayrope_depth_validity.to(
+                device=x.device,
+                dtype=torch.bool,
+            )
+            predicted_depth = torch.stack(
+                [
+                    torch.log(rayrope_depth.clamp_min(1e-2)),
+                    torch.zeros_like(rayrope_depth),
+                ],
+                dim=-1,
+            ).reshape(batch, num_views * tokens, 2)
+            ray_validity = rayrope_depth_validity.reshape(
+                batch, 1, num_views * tokens, 1
+            )
+        else:
+            if rayrope_depth is not None or rayrope_depth_validity is not None:
+                raise ValueError(
+                    "cached RayRoPE depth was supplied to predict_dsig mode"
+                )
+            predicted_depth = self.rayrope_depth_proj(x).view(
+                batch, num_views, tokens, 2
+            ).reshape(batch, num_views * tokens, 2)
+            ray_validity = None
         coefficients = self.rayrope_encoding.prepare_coefficients(
             viewmats,
             intrinsics,
@@ -364,6 +416,8 @@ class MMDiTJointAttention(nn.Module):
             coefficients.query_sin,
             inverse=True,
         ).to(attention_dtype)
+        if ray_validity is not None:
+            query_ray = query_ray * ray_validity.to(attention_dtype)
 
         score_gate = self.rayrope_score_gate.view(
             1, self.num_heads, 1, 1
@@ -388,6 +442,26 @@ class MMDiTJointAttention(nn.Module):
             float(base_dim + ray_dim) / float(base_dim)
         ) ** 0.5
         ray_score_scale = (float(base_dim) / float(ray_dim)) ** 0.5
+        attention_mask = attn_mask
+        if reference_logit_count_correction and num_views > 2:
+            reference_bias = query_base.new_zeros(
+                (batch, 1, 1, key_joint.shape[2])
+            )
+            reference_bias[..., text_tokens + tokens :] = -math.log(
+                num_views - 1
+            )
+            if attention_mask is None:
+                attention_mask = reference_bias
+            elif attention_mask.dtype == torch.bool:
+                additive_mask = torch.zeros_like(
+                    attention_mask,
+                    dtype=query_base.dtype,
+                ).masked_fill(~attention_mask, float("-inf"))
+                attention_mask = additive_mask + reference_bias
+            else:
+                attention_mask = (
+                    attention_mask.to(query_base.dtype) + reference_bias
+                )
         output_views = []
         for camera_index in range(num_views):
             start = camera_index * tokens
@@ -404,6 +478,15 @@ class MMDiTJointAttention(nn.Module):
                 coefficients.key_value_sin[camera_index],
                 inverse=True,
             ).to(attention_dtype)
+            if ray_validity is not None:
+                key_ray_camera = (
+                    key_ray_camera
+                    * ray_validity.to(attention_dtype)
+                )
+                value_ray_camera = (
+                    value_ray_camera
+                    * ray_validity.to(attention_dtype)
+                )
             if text_on:
                 ray_zeros = key_ray_camera.new_zeros(
                     batch, self.num_heads, text_tokens, ray_dim
@@ -438,7 +521,7 @@ class MMDiTJointAttention(nn.Module):
                 key_augmented,
                 value_augmented,
                 dropout_p=0.0,
-                attn_mask=attn_mask,
+                attn_mask=attention_mask,
             )
             output_base = output_augmented[..., :base_dim]
             output_ray = apply_rayrope(
@@ -447,6 +530,10 @@ class MMDiTJointAttention(nn.Module):
                 coefficients.query_sin[:, start:end],
                 inverse=False,
             ).to(attention_dtype)
+            if ray_validity is not None:
+                output_ray = output_ray * ray_validity[
+                    :, :, start:end
+                ].to(attention_dtype)
             output_base = output_base + F.pad(
                 output_ray * value_gate,
                 (0, base_dim - ray_dim),
@@ -463,7 +550,7 @@ class MMDiTJointAttention(nn.Module):
             key_joint,
             value_joint,
             dropout_p=0.0,
-            attn_mask=attn_mask,
+            attn_mask=attention_mask,
         )
         return output_image, output_text
 
@@ -564,6 +651,9 @@ class MMDiTJointAttention(nn.Module):
             prope_intrinsics: torch.Tensor = None,
             patch_grid=None,
             camera_keep: torch.Tensor = None,
+            rayrope_depth: torch.Tensor = None,
+            rayrope_depth_validity: torch.Tensor = None,
+            reference_logit_count_correction: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # y is None when the text stream is disabled: the attention then runs single-stream over
         # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
@@ -632,6 +722,11 @@ class MMDiTJointAttention(nn.Module):
                 patch_grid,
                 camera_keep,
                 attn_mask,
+                rayrope_depth=rayrope_depth,
+                rayrope_depth_validity=rayrope_depth_validity,
+                reference_logit_count_correction=(
+                    reference_logit_count_correction
+                ),
             )
         else:
             # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so
@@ -645,12 +740,36 @@ class MMDiTJointAttention(nn.Module):
                 v_joint = torch.cat([vy, vx], dim=2)
             else:
                 q_joint, k_joint, v_joint = qx, kx, vx
+            attention_mask = attn_mask
+            if reference_logit_count_correction and num_views > 2:
+                # Keep the aggregate prior mass assigned to the reference
+                # group invariant as K changes. Content-dependent differences
+                # between individual references remain untouched.
+                n_txt = Ny if text_on else 0
+                reference_bias = q_joint.new_zeros(
+                    (q_joint.shape[0], 1, 1, k_joint.shape[2])
+                )
+                reference_bias[..., n_txt + Nx :] = -math.log(
+                    num_views - 1
+                )
+                if attention_mask is None:
+                    attention_mask = reference_bias
+                elif attention_mask.dtype == torch.bool:
+                    additive_mask = torch.zeros_like(
+                        attention_mask,
+                        dtype=q_joint.dtype,
+                    ).masked_fill(~attention_mask, float("-inf"))
+                    attention_mask = additive_mask + reference_bias
+                else:
+                    attention_mask = (
+                        attention_mask.to(q_joint.dtype) + reference_bias
+                    )
             out_joint = F.scaled_dot_product_attention(
                 q_joint,
                 k_joint,
                 v_joint,
                 dropout_p=0.0,
-                attn_mask=attn_mask,
+                attn_mask=attention_mask,
             )
             n_txt = Ny if text_on else 0
             out_x = split_views(
@@ -762,6 +881,9 @@ class MMDiTBlockT2I(nn.Module):
         prope_intrinsics=None,
         patch_grid=None,
         camera_keep=None,
+        rayrope_depth=None,
+        rayrope_depth_validity=None,
+        reference_logit_count_correction=False,
     ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
@@ -796,6 +918,11 @@ class MMDiTBlockT2I(nn.Module):
             prope_intrinsics=prope_intrinsics,
             patch_grid=patch_grid,
             camera_keep=camera_keep,
+            rayrope_depth=rayrope_depth,
+            rayrope_depth_validity=rayrope_depth_validity,
+            reference_logit_count_correction=(
+                reference_logit_count_correction
+            ),
         )
         x = x + gate_msa_x * attn_x
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
@@ -1179,6 +1306,63 @@ class PixDiT_T2I(nn.Module):
             intrinsics.to(device=device, dtype=torch.float32),
         )
 
+    @staticmethod
+    def _prepare_rayrope_depth(
+        depth: torch.Tensor,
+        validity: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        token_count: int,
+        device,
+        depth_type: str,
+    ):
+        if depth_type != "cached_gs":
+            if depth is not None or validity is not None:
+                raise ValueError(
+                    "cached RayRoPE depth was supplied while "
+                    f"rayrope_depth_type={depth_type!r}"
+                )
+            return None, None
+        if depth is None or validity is None:
+            raise ValueError(
+                "rayrope_depth_type='cached_gs' requires both "
+                "rayrope_depth and rayrope_depth_validity"
+            )
+        if depth.dim() == 2:
+            depth = depth.unsqueeze(0)
+        if validity.dim() == 2:
+            validity = validity.unsqueeze(0)
+        expected_suffix = (num_views, token_count)
+        if depth.dim() != 3 or tuple(depth.shape[1:]) != expected_suffix:
+            raise ValueError(
+                "RayRoPE depth must be [B,V,L] with suffix "
+                f"{expected_suffix}, got {tuple(depth.shape)}"
+            )
+        if tuple(validity.shape) != tuple(depth.shape):
+            raise ValueError(
+                "RayRoPE validity must match depth shape, got "
+                f"{tuple(validity.shape)} versus {tuple(depth.shape)}"
+            )
+        if model_rows % num_views:
+            raise ValueError(
+                f"model rows {model_rows} are not divisible by "
+                f"num_views={num_views}"
+            )
+        model_batch = model_rows // num_views
+        if model_batch % depth.shape[0]:
+            raise ValueError(
+                f"RayRoPE depth batch {depth.shape[0]} does not divide "
+                f"model batch {model_batch}"
+            )
+        if depth.shape[0] != model_batch:
+            repeats = model_batch // depth.shape[0]
+            depth = depth.repeat(repeats, 1, 1)
+            validity = validity.repeat(repeats, 1, 1)
+        return (
+            depth.to(device=device, dtype=torch.float32),
+            validity.to(device=device, dtype=torch.bool),
+        )
+
     def _embed_pixel_depth(
         self,
         depth: torch.Tensor,
@@ -1257,6 +1441,9 @@ class PixDiT_T2I(nn.Module):
         depth=None,
         camera_w2cs=None,
         camera_intrinsics=None,
+        rayrope_depth=None,
+        rayrope_depth_validity=None,
+        reference_logit_count_correction=False,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -1341,6 +1528,22 @@ class PixDiT_T2I(nn.Module):
             camera_w2cs = camera_intrinsics = None
             camera_keep = None
             camera_ray_patches = camera_ray_keep = None
+        if self.camera_rayrope_enabled:
+            rayrope_depth, rayrope_depth_validity = (
+                self._prepare_rayrope_depth(
+                    rayrope_depth,
+                    rayrope_depth_validity,
+                    B,
+                    num_views,
+                    L,
+                    x.device,
+                    self.rayrope_depth_type,
+                )
+            )
+        elif rayrope_depth is not None or rayrope_depth_validity is not None:
+            raise ValueError(
+                "RayRoPE depth tensors were supplied while RayRoPE is disabled"
+            )
 
         pos = self.fetch_pos(Hs, Ws, x.device)
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
@@ -1415,6 +1618,11 @@ class PixDiT_T2I(nn.Module):
                     prope_intrinsics=camera_intrinsics,
                     patch_grid=(Hs, Ws),
                     camera_keep=camera_keep,
+                    rayrope_depth=rayrope_depth,
+                    rayrope_depth_validity=rayrope_depth_validity,
+                    reference_logit_count_correction=(
+                        reference_logit_count_correction
+                    ),
                 )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s

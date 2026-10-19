@@ -175,7 +175,18 @@ class PixDiTTrainer(nn.Module):
             nn.Linear(projector_dim, 768),
         )
 
-    def forward(self, x, timestep, y=None, mask=None, data_info=None, repa_tokens=None, num_views=1, **kwargs):
+    def forward(
+        self,
+        x,
+        timestep,
+        y=None,
+        mask=None,
+        data_info=None,
+        repa_tokens=None,
+        num_views=1,
+        reference_logit_count_correction=False,
+        **kwargs,
+    ):
         """``num_views`` > 1: ``x`` and ``timestep`` are per ROW (``B*V``, b-major), while ``y``
         and ``mask`` are per SAMPLE (``B``) because the text stream is shared across a sample's
         views. Forwarded verbatim to the core; the return shape is unchanged (``[B*V,3,H,W]``
@@ -203,6 +214,16 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        rayrope_depth = (
+            data_info.get("rayrope_depth")
+            if isinstance(data_info, dict)
+            else None
+        )
+        rayrope_depth_validity = (
+            data_info.get("rayrope_depth_validity")
+            if isinstance(data_info, dict)
+            else None
+        )
         if y is None:
             # Text stream disabled: nothing to squeeze, check or cast. The core skips every
             # text-shaped module rather than being fed zeros, so no text weight is touched.
@@ -219,6 +240,11 @@ class PixDiTTrainer(nn.Module):
                 depth=depth,
                 camera_w2cs=camera_w2cs,
                 camera_intrinsics=camera_intrinsics,
+                rayrope_depth=rayrope_depth,
+                rayrope_depth_validity=rayrope_depth_validity,
+                reference_logit_count_correction=(
+                    reference_logit_count_correction
+                ),
             )
             return {"x": out, "repa_loss": None}
         if y.dim() == 4:
@@ -249,6 +275,11 @@ class PixDiTTrainer(nn.Module):
             depth=depth,
             camera_w2cs=camera_w2cs,
             camera_intrinsics=camera_intrinsics,
+            rayrope_depth=rayrope_depth,
+            rayrope_depth_validity=rayrope_depth_validity,
+            reference_logit_count_correction=(
+                reference_logit_count_correction
+            ),
         )
         repa_loss = None
         if repa_tokens is not None:

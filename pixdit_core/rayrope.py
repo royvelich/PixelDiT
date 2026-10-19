@@ -96,9 +96,9 @@ class RayRoPEEncoding(torch.nn.Module):
                 "official-paper RayRoPE requires three rays per patch "
                 "(num_rays_per_patch=3)"
             )
-        if self.depth_type != "predict_dsig":
+        if self.depth_type not in ("predict_dsig", "cached_gs"):
             raise ValueError(
-                "official-paper RayRoPE requires depth_type='predict_dsig'"
+                "RayRoPE depth_type must be 'predict_dsig' or 'cached_gs'"
             )
         if self.denc_type != "d":
             raise ValueError(
