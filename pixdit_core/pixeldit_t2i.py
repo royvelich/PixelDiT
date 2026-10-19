@@ -18,6 +18,10 @@ from .modules import (
 )
 from .prope import PropeDotProductAttention, invert_se3
 from .rayrope import RayRoPEEncoding, apply_rayrope
+from .rayrope_parallel import (
+    ParallelRayRoPECrossAttention,
+    build_official_camray_patches,
+)
 
 
 def merge_views(t: torch.Tensor, num_views: int) -> torch.Tensor:
@@ -823,6 +827,7 @@ class MMDiTBlockT2I(nn.Module):
         self.adaLN_modulation_img = adaLN_modulation_img if adaLN_modulation_img is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.adaLN_modulation_txt = adaLN_modulation_txt if adaLN_modulation_txt is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.camera_ray_embedder = None
+        self.parallel_rayrope = None
 
     def enable_camera_conditioning(
         self,
@@ -842,6 +847,14 @@ class MMDiTBlockT2I(nn.Module):
         rayrope_init_sigma: float = 3.0,
         rayrope_score_gate_init: float = 0.0,
         rayrope_value_gate_init: float = 0.0,
+        parallel_rayrope_enabled: bool = False,
+        parallel_rayrope_patch_size: int = 16,
+        parallel_rayrope_num_heads: int = 8,
+        parallel_rayrope_head_dim: int = 96,
+        parallel_ray_token_dim: int = 0,
+        parallel_rayrope_scale: float = 0.1,
+        parallel_rayrope_learnable_scale: bool = False,
+        parallel_rayrope_mask_invalid_depth: bool = True,
     ) -> None:
         if rays_enabled:
             self.camera_ray_embedder = nn.Linear(
@@ -865,6 +878,25 @@ class MMDiTBlockT2I(nn.Module):
                 score_gate_init=rayrope_score_gate_init,
                 value_gate_init=rayrope_value_gate_init,
             )
+        if parallel_rayrope_enabled:
+            self.parallel_rayrope = ParallelRayRoPECrossAttention(
+                hidden_size=self.hidden_size,
+                patch_size=parallel_rayrope_patch_size,
+                num_heads=parallel_rayrope_num_heads,
+                head_dim=parallel_rayrope_head_dim,
+                ray_token_dim=parallel_ray_token_dim,
+                pos_enc_type=rayrope_pos_enc_type,
+                num_rays_per_patch=rayrope_num_rays_per_patch,
+                depth_type=rayrope_depth_type,
+                denc_type=rayrope_denc_type,
+                freq_base=rayrope_freq_base,
+                apply_vo=rayrope_apply_vo,
+                init_depth=rayrope_init_depth,
+                init_sigma=rayrope_init_sigma,
+                residual_scale=parallel_rayrope_scale,
+                learnable_scale=parallel_rayrope_learnable_scale,
+                mask_invalid_depth=parallel_rayrope_mask_invalid_depth,
+            )
 
     def forward(
         self,
@@ -884,6 +916,8 @@ class MMDiTBlockT2I(nn.Module):
         rayrope_depth=None,
         rayrope_depth_validity=None,
         reference_logit_count_correction=False,
+        parallel_ray_token_patches=None,
+        image_size=None,
     ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
@@ -907,24 +941,95 @@ class MMDiTBlockT2I(nn.Module):
                 )
             x_norm = x_norm + ray_embedding
         y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
-        attn_x, attn_y = self.attn(
-            x_norm,
-            y_norm,
-            pos_img,
-            pos_txt,
-            attn_mask,
-            num_views,
-            prope_w2cs=prope_w2cs,
-            prope_intrinsics=prope_intrinsics,
-            patch_grid=patch_grid,
-            camera_keep=camera_keep,
-            rayrope_depth=rayrope_depth,
-            rayrope_depth_validity=rayrope_depth_validity,
-            reference_logit_count_correction=(
-                reference_logit_count_correction
-            ),
-        )
+        if self.parallel_rayrope is None:
+            attn_x, attn_y = self.attn(
+                x_norm,
+                y_norm,
+                pos_img,
+                pos_txt,
+                attn_mask,
+                num_views,
+                prope_w2cs=prope_w2cs,
+                prope_intrinsics=prope_intrinsics,
+                patch_grid=patch_grid,
+                camera_keep=camera_keep,
+                rayrope_depth=rayrope_depth,
+                rayrope_depth_validity=rayrope_depth_validity,
+                reference_logit_count_correction=(
+                    reference_logit_count_correction
+                ),
+            )
+        else:
+            if x.shape[0] % num_views:
+                raise ValueError(
+                    "parallel RayRoPE image rows are not divisible by views"
+                )
+            samples = x.shape[0] // num_views
+            token_count = x.shape[1]
+            feature_dim = x.shape[2]
+            normalized_views = x_norm.view(
+                samples, num_views, token_count, feature_dim
+            )
+            render_norm = normalized_views[:, 0]
+            render_attention, attn_y = self.attn(
+                render_norm,
+                y_norm,
+                pos_img,
+                pos_txt,
+                attn_mask,
+                1,
+            )
+            if num_views > 1:
+                reference_norm = normalized_views[:, 1:].reshape(
+                    samples * (num_views - 1),
+                    token_count,
+                    feature_dim,
+                )
+                reference_attention, _ = self.attn(
+                    reference_norm,
+                    None,
+                    pos_img,
+                    None,
+                    None,
+                    1,
+                )
+                attn_x = torch.cat(
+                    [
+                        render_attention[:, None],
+                        reference_attention.view(
+                            samples,
+                            num_views - 1,
+                            token_count,
+                            feature_dim,
+                        ),
+                    ],
+                    dim=1,
+                ).reshape_as(x)
+            else:
+                attn_x = render_attention
         x = x + gate_msa_x * attn_x
+        if self.parallel_rayrope is not None:
+            if (
+                prope_w2cs is None
+                or prope_intrinsics is None
+                or patch_grid is None
+                or image_size is None
+            ):
+                raise ValueError(
+                    "parallel RayRoPE requires cameras, patch_grid and image_size"
+                )
+            x = x + self.parallel_rayrope(
+                x,
+                num_views=num_views,
+                viewmats=prope_w2cs,
+                normalized_intrinsics=prope_intrinsics,
+                patch_grid=patch_grid,
+                image_size=image_size,
+                ray_token_patches=parallel_ray_token_patches,
+                camera_keep=camera_keep,
+                depth=rayrope_depth,
+                depth_validity=rayrope_depth_validity,
+            )
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
         if not text_on:
             return x, None
@@ -975,6 +1080,12 @@ class PixDiT_T2I(nn.Module):
         rayrope_init_sigma: float = 3.0,
         rayrope_score_gate_init: float = 0.0,
         rayrope_value_gate_init: float = 0.0,
+        rayrope_parallel_token_encoding: str = "camray",
+        rayrope_parallel_num_heads: int = 8,
+        rayrope_parallel_head_dim: int = 96,
+        rayrope_parallel_scale: float = 0.1,
+        rayrope_parallel_learnable_scale: bool = False,
+        rayrope_parallel_mask_invalid_depth: bool = True,
         pit_view_attention: str = "separate",
         pit_camera_conditioning_mode: str = "none",
         pit_reference_flow: bool = True,
@@ -1007,10 +1118,12 @@ class PixDiT_T2I(nn.Module):
             "rays_prope",
             "rayrope",
             "rays_rayrope",
+            "rayrope_parallel",
         ):
             raise ValueError(
                 "camera_conditioning_mode must be "
-                "none|rays|prope|rays_prope|rayrope|rays_rayrope"
+                "none|rays|prope|rays_prope|rayrope|rays_rayrope|"
+                "rayrope_parallel"
             )
         self.camera_rays_enabled = self.camera_conditioning_mode in (
             "rays",
@@ -1024,6 +1137,9 @@ class PixDiT_T2I(nn.Module):
         self.camera_rayrope_enabled = self.camera_conditioning_mode in (
             "rayrope",
             "rays_rayrope",
+        )
+        self.camera_rayrope_parallel_enabled = (
+            self.camera_conditioning_mode == "rayrope_parallel"
         )
         self.pit_view_attention = str(pit_view_attention)
         if self.pit_view_attention not in ("separate", "joint"):
@@ -1070,6 +1186,37 @@ class PixDiT_T2I(nn.Module):
         self.rayrope_init_sigma = float(rayrope_init_sigma)
         self.rayrope_score_gate_init = float(rayrope_score_gate_init)
         self.rayrope_value_gate_init = float(rayrope_value_gate_init)
+        self.rayrope_parallel_token_encoding = str(
+            rayrope_parallel_token_encoding
+        )
+        if self.rayrope_parallel_token_encoding not in (
+            "none",
+            "camray",
+            "canonical_plucker",
+            "both",
+        ):
+            raise ValueError(
+                "rayrope_parallel_token_encoding must be "
+                "none|camray|canonical_plucker|both"
+            )
+        self.rayrope_parallel_num_heads = int(rayrope_parallel_num_heads)
+        self.rayrope_parallel_head_dim = int(rayrope_parallel_head_dim)
+        self.rayrope_parallel_scale = float(rayrope_parallel_scale)
+        self.rayrope_parallel_learnable_scale = bool(
+            rayrope_parallel_learnable_scale
+        )
+        self.rayrope_parallel_mask_invalid_depth = bool(
+            rayrope_parallel_mask_invalid_depth
+        )
+        parallel_token_channels = {
+            "none": 0,
+            "camray": 6,
+            "canonical_plucker": 6,
+            "both": 12,
+        }[self.rayrope_parallel_token_encoding]
+        self.rayrope_parallel_token_dim = (
+            parallel_token_channels * self.patch_size * self.patch_size
+        )
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
             raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
@@ -1182,6 +1329,28 @@ class PixDiT_T2I(nn.Module):
                             ),
                             rayrope_value_gate_init=(
                                 self.rayrope_value_gate_init
+                            ),
+                            parallel_rayrope_enabled=(
+                                self.camera_rayrope_parallel_enabled
+                            ),
+                            parallel_rayrope_patch_size=self.patch_size,
+                            parallel_rayrope_num_heads=(
+                                self.rayrope_parallel_num_heads
+                            ),
+                            parallel_rayrope_head_dim=(
+                                self.rayrope_parallel_head_dim
+                            ),
+                            parallel_ray_token_dim=(
+                                self.rayrope_parallel_token_dim
+                            ),
+                            parallel_rayrope_scale=(
+                                self.rayrope_parallel_scale
+                            ),
+                            parallel_rayrope_learnable_scale=(
+                                self.rayrope_parallel_learnable_scale
+                            ),
+                            parallel_rayrope_mask_invalid_depth=(
+                                self.rayrope_parallel_mask_invalid_depth
                             ),
                         )
                 if self.pit_camera_conditioning_mode != "none":
@@ -1519,6 +1688,42 @@ class PixDiT_T2I(nn.Module):
             else:
                 camera_ray_patches = None
                 camera_ray_keep = None
+            if self.camera_rayrope_parallel_enabled:
+                parallel_ray_parts = []
+                if self.rayrope_parallel_token_encoding in (
+                    "camray",
+                    "both",
+                ):
+                    parallel_ray_parts.append(
+                        build_official_camray_patches(
+                            camera_intrinsics,
+                            H,
+                            W,
+                            self.patch_size,
+                            x.dtype,
+                        )
+                    )
+                if self.rayrope_parallel_token_encoding in (
+                    "canonical_plucker",
+                    "both",
+                ):
+                    parallel_ray_parts.append(
+                        build_plucker_ray_patches(
+                            camera_w2cs,
+                            camera_intrinsics,
+                            H,
+                            W,
+                            self.patch_size,
+                            x.dtype,
+                        )
+                    )
+                parallel_ray_token_patches = (
+                    torch.cat(parallel_ray_parts, dim=-1)
+                    if parallel_ray_parts
+                    else None
+                )
+            else:
+                parallel_ray_token_patches = None
         else:
             if camera_w2cs is not None or camera_intrinsics is not None:
                 raise ValueError(
@@ -1528,7 +1733,11 @@ class PixDiT_T2I(nn.Module):
             camera_w2cs = camera_intrinsics = None
             camera_keep = None
             camera_ray_patches = camera_ray_keep = None
-        if self.camera_rayrope_enabled:
+            parallel_ray_token_patches = None
+        if (
+            self.camera_rayrope_enabled
+            or self.camera_rayrope_parallel_enabled
+        ):
             rayrope_depth, rayrope_depth_validity = (
                 self._prepare_rayrope_depth(
                     rayrope_depth,
@@ -1595,11 +1804,21 @@ class PixDiT_T2I(nn.Module):
                     m = m.squeeze(1)
                 if m.dim() == 2:
                     pad = (m == 0)
-                    # The key axis is [text | V*L image tokens] at batch Btxt after the merge.
-                    # Image tokens are never padded, so their half stays all-False.
-                    pad_img = torch.zeros((Btxt, num_views * L), dtype=torch.bool, device=x.device)
+                    # Parallel RayRoPE keeps the frozen base attention per-view,
+                    # so only the render's L image keys accompany text. Legacy
+                    # modes merge all V*L image keys.
+                    base_image_tokens = (
+                        L
+                        if self.camera_rayrope_parallel_enabled
+                        else num_views * L
+                    )
+                    pad_img = torch.zeros(
+                        (Btxt, base_image_tokens),
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
                     attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(
-                        Btxt, 1, 1, Ltxt + num_views * L
+                        Btxt, 1, 1, Ltxt + base_image_tokens
                     )
             self.last_repa_tokens = None
             s = s0
@@ -1623,6 +1842,10 @@ class PixDiT_T2I(nn.Module):
                     reference_logit_count_correction=(
                         reference_logit_count_correction
                     ),
+                    parallel_ray_token_patches=(
+                        parallel_ray_token_patches
+                    ),
+                    image_size=(H, W),
                 )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s

@@ -130,6 +130,24 @@ class PixDiTTrainer(nn.Module):
                 "rayrope_value_gate_init": (
                     restore_cfg.rayrope_value_gate_init
                 ),
+                "rayrope_parallel_token_encoding": (
+                    restore_cfg.rayrope_parallel_token_encoding
+                ),
+                "rayrope_parallel_num_heads": (
+                    restore_cfg.rayrope_parallel_num_heads
+                ),
+                "rayrope_parallel_head_dim": (
+                    restore_cfg.rayrope_parallel_head_dim
+                ),
+                "rayrope_parallel_scale": (
+                    restore_cfg.rayrope_parallel_scale
+                ),
+                "rayrope_parallel_learnable_scale": (
+                    restore_cfg.rayrope_parallel_learnable_scale
+                ),
+                "rayrope_parallel_mask_invalid_depth": (
+                    restore_cfg.rayrope_parallel_mask_invalid_depth
+                ),
             }
 
         if PixDiT_T2I is None:

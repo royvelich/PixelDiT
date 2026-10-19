@@ -580,6 +580,19 @@ def train(
                 _rc = _ga()
                 if _rc is not None and _rc.perceptual_enabled():
                     logs["perceptual_warmup"] = _rc.perceptual_warmup_factor(_gs())
+                if (
+                    _rc is not None
+                    and _rc.camera_rayrope_parallel_enabled()
+                ):
+                    from restore.config import (
+                        completed_optimizer_updates as _cou,
+                        parallel_mlp_lora_stage_active as _pmla,
+                    )
+
+                    logs["rayrope_parallel_optimizer_updates"] = float(_cou())
+                    logs["rayrope_parallel_stage"] = (
+                        2.0 if _pmla(_rc) else 1.0
+                    )
             except Exception:
                 pass
             log_buffer.update(logs)
