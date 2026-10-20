@@ -1,8 +1,10 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Tuple
+from typing import Dict, Tuple
 
 from .pixeldit_c2i import PatchTokenEmbedder, PixelTokenEmbedder, PiTBlock
 from .modules import (
@@ -101,6 +103,268 @@ class PatchGeometryEmbedder(nn.Module):
                 * keep.to(geometry.dtype)
             ).reshape_as(geometry)
         return self.proj_out(F.silu(self.proj_in(geometry)))
+
+
+class GeometryLocalAuxAttention(nn.Module):
+    """Independent local cross-attention from render tokens to each auxiliary.
+
+    Reference normalization is deliberately per auxiliary reference.  The
+    zero-initialized output projection makes the entire module an exact no-op
+    when first attached to a pretrained rank-0 model.
+    """
+
+    geometry_dim = 6
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        window_radius: int,
+        gate_hidden_dim: int,
+        gate_bias: float,
+        query_chunk_size: int,
+        residual_scale: float,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        self.inner_dim = self.num_heads * self.head_dim
+        self.window_radius = int(window_radius)
+        self.query_chunk_size = int(query_chunk_size)
+        self.residual_scale = float(residual_scale)
+
+        self.q_proj = nn.Linear(self.dim, self.inner_dim, bias=False)
+        self.k_proj = nn.Linear(self.dim, self.inner_dim, bias=False)
+        self.v_proj = nn.Linear(self.dim, self.inner_dim, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.out_proj = nn.Linear(self.inner_dim, self.dim, bias=True)
+        self.confidence = nn.Sequential(
+            nn.Linear(8, int(gate_hidden_dim), bias=True),
+            nn.SiLU(),
+            nn.Linear(int(gate_hidden_dim), 1, bias=True),
+        )
+
+        offsets = [
+            (dy, dx)
+            for dy in range(-self.window_radius, self.window_radius + 1)
+            for dx in range(-self.window_radius, self.window_radius + 1)
+        ]
+        self.register_buffer(
+            "local_offsets",
+            torch.tensor(offsets, dtype=torch.long),
+            persistent=False,
+        )
+        self.center_offset_index = offsets.index((0, 0))
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        nn.init.zeros_(self.confidence[-1].weight)
+        nn.init.constant_(self.confidence[-1].bias, float(gate_bias))
+
+    def _project(self, layer, tokens):
+        shape = tokens.shape[:-1]
+        return layer(tokens).view(
+            *shape, self.num_heads, self.head_dim
+        )
+
+    def forward(
+        self,
+        render: torch.Tensor,
+        auxiliaries: torch.Tensor,
+        geometry: torch.Tensor,
+        active: torch.Tensor,
+        grid_height: int,
+        grid_width: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if render.dim() != 3:
+            raise ValueError(
+                f"render tokens must be [B,L,C], got {tuple(render.shape)}"
+            )
+        if auxiliaries.dim() != 4:
+            raise ValueError(
+                "auxiliary tokens must be [B,A,L,C], got "
+                f"{tuple(auxiliaries.shape)}"
+            )
+        batch, length, channels = render.shape
+        if auxiliaries.shape[0] != batch or auxiliaries.shape[2:] != (
+            length,
+            channels,
+        ):
+            raise ValueError(
+                "render/auxiliary token shapes disagree: "
+                f"{tuple(render.shape)} and {tuple(auxiliaries.shape)}"
+            )
+        auxiliary_count = auxiliaries.shape[1]
+        expected_geometry = (
+            batch,
+            auxiliary_count,
+            length,
+            self.geometry_dim,
+        )
+        if tuple(geometry.shape) != expected_geometry:
+            raise ValueError(
+                f"geometry must be {expected_geometry}, got {tuple(geometry.shape)}"
+            )
+        if tuple(active.shape) != (batch, auxiliary_count):
+            raise ValueError(
+                f"active must be {(batch, auxiliary_count)}, got {tuple(active.shape)}"
+            )
+        if length != int(grid_height) * int(grid_width):
+            raise ValueError(
+                f"token count {length} != grid {grid_height}x{grid_width}"
+            )
+
+        q = self._project(self.q_proj, render).permute(0, 2, 1, 3)
+        k = self._project(self.k_proj, auxiliaries).permute(0, 1, 3, 2, 4)
+        v = self._project(self.v_proj, auxiliaries).permute(0, 1, 3, 2, 4)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        offsets = self.local_offsets.to(device=geometry.device)
+        center_x = geometry[..., 0].round().long()
+        center_y = geometry[..., 1].round().long()
+        local_x = center_x[..., None] + offsets[:, 1]
+        local_y = center_y[..., None] + offsets[:, 0]
+        inside = (
+            (local_x >= 0)
+            & (local_x < int(grid_width))
+            & (local_y >= 0)
+            & (local_y < int(grid_height))
+        )
+        local_indices = (
+            local_y.clamp(0, int(grid_height) - 1) * int(grid_width)
+            + local_x.clamp(0, int(grid_width) - 1)
+        )
+        token_valid = (
+            (geometry[..., 3] > 0.5)
+            & (active[:, :, None] > 0.5)
+        )
+        local_valid = inside & token_valid[..., None]
+        window_size = offsets.shape[0]
+
+        correction_chunks = []
+        corr_sum = render.new_zeros(batch, dtype=torch.float32)
+        corr_count = render.new_zeros(batch, dtype=torch.float32)
+        gate_sum = render.new_zeros(batch, dtype=torch.float32)
+        gate_count = render.new_zeros(batch, dtype=torch.float32)
+        scale = self.head_dim ** -0.5
+
+        for start in range(0, length, self.query_chunk_size):
+            stop = min(length, start + self.query_chunk_size)
+            chunk = stop - start
+            indices = local_indices[:, :, start:stop]
+            gather_index = indices[:, :, None, :, :, None].expand(
+                batch,
+                auxiliary_count,
+                self.num_heads,
+                chunk,
+                window_size,
+                self.head_dim,
+            )
+            key_source = k[:, :, :, :, None, :].expand(
+                batch,
+                auxiliary_count,
+                self.num_heads,
+                length,
+                window_size,
+                self.head_dim,
+            )
+            value_source = v[:, :, :, :, None, :].expand_as(key_source)
+            local_k = torch.gather(key_source, 3, gather_index)
+            local_v = torch.gather(value_source, 3, gather_index)
+            q_chunk = q[:, None, :, start:stop, None, :]
+            scores = (q_chunk * local_k).sum(dim=-1) * scale
+            valid = local_valid[:, :, None, start:stop]
+            scores = scores.masked_fill(
+                ~valid,
+                -torch.finfo(scores.dtype).max,
+            )
+            weights = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
+            has_candidate = valid.any(dim=-1)
+            weights = weights * has_candidate[..., None].to(weights.dtype)
+
+            message = (weights[..., None] * local_v).sum(dim=-2)
+            matched_key = (weights[..., None] * local_k).sum(dim=-2)
+            entropy = -(
+                weights.float()
+                * weights.float().clamp_min(1e-8).log()
+            ).sum(dim=-1)
+            entropy = entropy / max(math.log(float(window_size)), 1.0)
+            best = scores.float().amax(dim=-1)
+            if window_size > 1:
+                top2 = scores.float().topk(2, dim=-1).values
+                margin = top2[..., 0] - top2[..., 1]
+            else:
+                margin = torch.zeros_like(best)
+            center_probability = weights[
+                ..., self.center_offset_index
+            ].float()
+            q_for_cos = F.normalize(
+                q[:, None, :, start:stop].float(),
+                dim=-1,
+            )
+            key_for_cos = F.normalize(matched_key.float(), dim=-1)
+            feature_cosine = (q_for_cos * key_for_cos).sum(dim=-1)
+
+            geom = geometry[:, :, start:stop]
+            gate_features = torch.stack(
+                [
+                    entropy.mean(dim=2),
+                    torch.tanh(best.mean(dim=2)),
+                    torch.tanh(margin.mean(dim=2)),
+                    center_probability.mean(dim=2),
+                    geom[..., 2].float(),
+                    geom[..., 4].float(),
+                    geom[..., 5].float(),
+                    feature_cosine.mean(dim=2),
+                ],
+                dim=-1,
+            ).to(render.dtype)
+            gate = torch.sigmoid(self.confidence(gate_features))
+            valid_token_chunk = token_valid[:, :, start:stop]
+            gate = gate * valid_token_chunk[..., None].to(gate.dtype)
+
+            delta = message.permute(0, 1, 3, 2, 4).reshape(
+                batch,
+                auxiliary_count,
+                chunk,
+                self.inner_dim,
+            )
+            numerator = (gate * delta).sum(dim=1)
+            denominator = gate.sum(dim=1)
+            correction_chunks.append(
+                # A confidence sum below one attenuates the whole residual,
+                # allowing the router to use neither auxiliary.  Above one,
+                # normalize to a confidence-weighted mean so the correction
+                # scale does not grow with the reference count.
+                numerator / denominator.clamp_min(1.0)
+            )
+
+            center_mean = center_probability.mean(dim=2)
+            corr = -center_mean.clamp_min(1e-8).log()
+            corr_sum += (
+                corr * valid_token_chunk.float()
+            ).sum(dim=(1, 2))
+            corr_count += valid_token_chunk.float().sum(dim=(1, 2))
+            gate_sum += (
+                gate[..., 0].float() * valid_token_chunk.float()
+            ).sum(dim=(1, 2))
+            gate_count += valid_token_chunk.float().sum(dim=(1, 2))
+
+        combined = torch.cat(correction_chunks, dim=1)
+        projected = self.out_proj(combined) * self.residual_scale
+        correction_rms = projected.float().square().mean(
+            dim=(1, 2)
+        ).sqrt()
+        stats = {
+            "correspondence_loss": corr_sum / corr_count.clamp_min(1.0),
+            "gate_mean": gate_sum / gate_count.clamp_min(1.0),
+            "valid_fraction": token_valid.float().mean(dim=(1, 2)),
+            "correction_rms": correction_rms,
+        }
+        return projected, stats
 
 
 class MMDiTJointAttention(nn.Module):
@@ -282,6 +546,15 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_dropout: float = 0.0,
         depth_channel_enabled: bool = False,
         depth_channel_dim: int = 1,
+        geometry_local_aux_enabled: bool = False,
+        geometry_local_aux_blocks=(),
+        geometry_local_aux_window_radius: int = 2,
+        geometry_local_aux_heads: int = 8,
+        geometry_local_aux_head_dim: int = 64,
+        geometry_local_aux_query_chunk_size: int = 256,
+        geometry_local_aux_gate_hidden_dim: int = 128,
+        geometry_local_aux_gate_bias: float = -2.0,
+        geometry_local_aux_residual_scale: float = 1.0,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -303,6 +576,7 @@ class PixDiT_T2I(nn.Module):
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.depth_channel_enabled = bool(depth_channel_enabled)
         self.depth_channel_dim = int(depth_channel_dim)
+        self.geometry_local_aux_enabled = bool(geometry_local_aux_enabled)
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
             raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
@@ -326,6 +600,32 @@ class PixDiT_T2I(nn.Module):
             )
             for _ in range(self.patch_depth)
         ])
+        self.geometry_local_aux_attentions = nn.ModuleDict()
+        if self.geometry_local_aux_enabled:
+            block_indices = [int(index) for index in geometry_local_aux_blocks]
+            invalid = [
+                index
+                for index in block_indices
+                if index < 0 or index >= self.patch_depth
+            ]
+            if invalid:
+                raise ValueError(
+                    "geometry-local auxiliary block indices exceed patch depth "
+                    f"{self.patch_depth}: {invalid}"
+                )
+            for index in block_indices:
+                self.geometry_local_aux_attentions[str(index)] = (
+                    GeometryLocalAuxAttention(
+                        self.hidden_size,
+                        geometry_local_aux_heads,
+                        geometry_local_aux_head_dim,
+                        geometry_local_aux_window_radius,
+                        geometry_local_aux_gate_hidden_dim,
+                        geometry_local_aux_gate_bias,
+                        geometry_local_aux_query_chunk_size,
+                        geometry_local_aux_residual_scale,
+                    )
+                )
         self.text_refine_blocks = None
         self.pixel_attn_hidden_size = (
             int(pixel_attn_hidden_size) if pixel_attn_hidden_size is not None else self.hidden_size
@@ -379,6 +679,7 @@ class PixDiT_T2I(nn.Module):
         self.precompute_pos = dict()
         self.precompute_pos_txt = dict()
         self.last_repa_tokens = None
+        self.last_geometry_local_aux_stats = None
 
         self.initialize_weights()
 
@@ -516,6 +817,57 @@ class PixDiT_T2I(nn.Module):
             )
         return geometry.to(device=device, dtype=dtype)
 
+    @staticmethod
+    def _prepare_geometry_local_aux(
+        geometry: torch.Tensor,
+        active: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        token_count: int,
+        device,
+        dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        sample_rows = model_rows // num_views
+        auxiliary_count = num_views - 2
+        if geometry.dim() != 4:
+            raise ValueError(
+                "geometry-local auxiliary data must be [B,A,L,F], got "
+                f"{tuple(geometry.shape)}"
+            )
+        if geometry.shape[1:] != (
+            auxiliary_count,
+            token_count,
+            GeometryLocalAuxAttention.geometry_dim,
+        ):
+            raise ValueError(
+                "geometry-local auxiliary shape disagrees with model views: "
+                f"got {tuple(geometry.shape)}, expected [B,{auxiliary_count},"
+                f"{token_count},{GeometryLocalAuxAttention.geometry_dim}]"
+            )
+        if active.dim() != 2 or active.shape[1] != auxiliary_count:
+            raise ValueError(
+                f"geometry-local active mask must be [B,{auxiliary_count}], "
+                f"got {tuple(active.shape)}"
+            )
+        if geometry.shape[0] != active.shape[0]:
+            raise ValueError(
+                "geometry and active-mask batch sizes disagree: "
+                f"{geometry.shape[0]} and {active.shape[0]}"
+            )
+        if sample_rows % geometry.shape[0]:
+            raise ValueError(
+                f"geometry batch {geometry.shape[0]} does not divide "
+                f"model sample batch {sample_rows}"
+            )
+        repeats = sample_rows // geometry.shape[0]
+        if repeats != 1:
+            geometry = geometry.repeat(repeats, 1, 1, 1)
+            active = active.repeat(repeats, 1)
+        return (
+            geometry.to(device=device, dtype=dtype),
+            active.to(device=device, dtype=dtype),
+        )
+
     def forward(
         self,
         x,
@@ -526,6 +878,9 @@ class PixDiT_T2I(nn.Module):
         num_views=1,
         patch_geometry=None,
         depth=None,
+        geometry_local_aux=None,
+        geometry_local_aux_active=None,
+        geometry_local_aux_disable=False,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -548,6 +903,38 @@ class PixDiT_T2I(nn.Module):
             x.device,
             x.dtype,
         )
+        self.last_geometry_local_aux_stats = None
+        if self.geometry_local_aux_enabled:
+            if num_views < 3:
+                raise ValueError(
+                    "geometry-local auxiliary fusion needs num_views >= 3 "
+                    "(render, rank-0, and at least one auxiliary)"
+                )
+            if geometry_local_aux is None or geometry_local_aux_active is None:
+                raise ValueError(
+                    "geometry-local auxiliary fusion requires geometry and "
+                    "an active-reference mask"
+                )
+            geometry_local_aux, geometry_local_aux_active = (
+                self._prepare_geometry_local_aux(
+                    geometry_local_aux,
+                    geometry_local_aux_active,
+                    B,
+                    num_views,
+                    L,
+                    x.device,
+                    x.dtype,
+                )
+            )
+        elif (
+            geometry_local_aux is not None
+            or geometry_local_aux_active is not None
+            or geometry_local_aux_disable
+        ):
+            raise ValueError(
+                "geometry-local auxiliary inputs were supplied while the "
+                "model mode is disabled"
+            )
 
         pos = self.fetch_pos(Hs, Ws, x.device)
         x_patches = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
@@ -607,10 +994,139 @@ class PixDiT_T2I(nn.Module):
                     )
             self.last_repa_tokens = None
             s = s0
-            for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
-                if 0 < self.repa_encoder_index == (i + 1):
-                    self.last_repa_tokens = s
+            if not self.geometry_local_aux_enabled:
+                for i in range(self.patch_depth):
+                    s, y_emb = self.patch_blocks[i](
+                        s,
+                        y_emb,
+                        condition,
+                        pos,
+                        pos_txt,
+                        attn_mask_joint,
+                        num_views,
+                    )
+                    if 0 < self.repa_encoder_index == (i + 1):
+                        self.last_repa_tokens = s
+            else:
+                sample_batch = B // num_views
+                auxiliary_count = num_views - 2
+                block_stats = []
+                if text_on and attn_mask_joint is not None:
+                    base_mask = torch.cat(
+                        [
+                            attn_mask_joint[..., :Ltxt],
+                            torch.zeros(
+                                sample_batch,
+                                1,
+                                1,
+                                2 * L,
+                                dtype=torch.bool,
+                                device=x.device,
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    base_mask = None
+                for i in range(self.patch_depth):
+                    views = s.view(
+                        sample_batch,
+                        num_views,
+                        L,
+                        self.hidden_size,
+                    )
+                    cond_views = condition.view(
+                        sample_batch,
+                        num_views,
+                        1,
+                        self.hidden_size,
+                    )
+                    base_rows = views[:, :2].reshape(
+                        sample_batch * 2,
+                        L,
+                        self.hidden_size,
+                    )
+                    base_cond = cond_views[:, :2].reshape(
+                        sample_batch * 2,
+                        1,
+                        self.hidden_size,
+                    )
+                    base_rows, y_emb = self.patch_blocks[i](
+                        base_rows,
+                        y_emb,
+                        base_cond,
+                        pos,
+                        pos_txt,
+                        base_mask,
+                        2,
+                    )
+                    auxiliary_rows = views[:, 2:].reshape(
+                        sample_batch * auxiliary_count,
+                        L,
+                        self.hidden_size,
+                    )
+                    auxiliary_cond = cond_views[:, 2:].reshape(
+                        sample_batch * auxiliary_count,
+                        1,
+                        self.hidden_size,
+                    )
+                    auxiliary_rows, _ = self.patch_blocks[i](
+                        auxiliary_rows,
+                        None,
+                        auxiliary_cond,
+                        pos,
+                        None,
+                        None,
+                        1,
+                    )
+                    views = torch.cat(
+                        [
+                            base_rows.view(
+                                sample_batch,
+                                2,
+                                L,
+                                self.hidden_size,
+                            ),
+                            auxiliary_rows.view(
+                                sample_batch,
+                                auxiliary_count,
+                                L,
+                                self.hidden_size,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    attention = (
+                        self.geometry_local_aux_attentions[str(i)]
+                        if str(i) in self.geometry_local_aux_attentions
+                        else None
+                    )
+                    if attention is not None and not geometry_local_aux_disable:
+                        correction, stats = attention(
+                            views[:, 0],
+                            views[:, 2:],
+                            geometry_local_aux,
+                            geometry_local_aux_active,
+                            Hs,
+                            Ws,
+                        )
+                        render = views[:, 0] + correction
+                        views = torch.cat(
+                            [render[:, None], views[:, 1:]],
+                            dim=1,
+                        )
+                        block_stats.append(stats)
+                    s = views.reshape(B, L, self.hidden_size)
+                    if 0 < self.repa_encoder_index == (i + 1):
+                        self.last_repa_tokens = s
+                if block_stats:
+                    self.last_geometry_local_aux_stats = {
+                        name: torch.stack(
+                            [stats[name] for stats in block_stats],
+                            dim=0,
+                        ).mean(dim=0)
+                        for name in block_stats[0]
+                    }
             s = torch.nn.functional.silu(t_emb + s)
         if not (0 < self.repa_encoder_index <= self.patch_depth):
             self.last_repa_tokens = s

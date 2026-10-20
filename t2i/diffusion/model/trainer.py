@@ -67,6 +67,7 @@ class PixDiTTrainer(nn.Module):
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
         depth_channel_kwargs = {}
+        geometry_local_aux_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -87,6 +88,37 @@ class PixDiTTrainer(nn.Module):
             depth_channel_kwargs = {
                 "depth_channel_enabled": True,
                 "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
+            }
+        if (
+            restore_cfg is not None
+            and restore_cfg.geometry_local_aux_fusion
+        ):
+            geometry_local_aux_kwargs = {
+                "geometry_local_aux_enabled": True,
+                "geometry_local_aux_blocks": (
+                    restore_cfg.geometry_local_aux_block_indices()
+                ),
+                "geometry_local_aux_window_radius": (
+                    restore_cfg.geometry_local_aux_window_radius
+                ),
+                "geometry_local_aux_heads": (
+                    restore_cfg.geometry_local_aux_heads
+                ),
+                "geometry_local_aux_head_dim": (
+                    restore_cfg.geometry_local_aux_head_dim
+                ),
+                "geometry_local_aux_query_chunk_size": (
+                    restore_cfg.geometry_local_aux_query_chunk_size
+                ),
+                "geometry_local_aux_gate_hidden_dim": (
+                    restore_cfg.geometry_local_aux_gate_hidden_dim
+                ),
+                "geometry_local_aux_gate_bias": (
+                    restore_cfg.geometry_local_aux_gate_bias
+                ),
+                "geometry_local_aux_residual_scale": (
+                    restore_cfg.geometry_local_aux_residual_scale
+                ),
             }
 
         if PixDiT_T2I is None:
@@ -111,6 +143,7 @@ class PixDiTTrainer(nn.Module):
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
             **depth_channel_kwargs,
+            **geometry_local_aux_kwargs,
         )
 
         self.image_size = int(image_size)
@@ -148,6 +181,21 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        geometry_local_aux = (
+            data_info.get("geometry_local_aux")
+            if isinstance(data_info, dict)
+            else None
+        )
+        geometry_local_aux_active = (
+            data_info.get("geometry_local_aux_active")
+            if isinstance(data_info, dict)
+            else None
+        )
+        geometry_local_aux_disable = bool(
+            data_info.get("geometry_local_aux_disable", False)
+            if isinstance(data_info, dict)
+            else False
+        )
         if y is None:
             # Text stream disabled: nothing to squeeze, check or cast. The core skips every
             # text-shaped module rather than being fed zeros, so no text weight is touched.
@@ -162,8 +210,19 @@ class PixDiTTrainer(nn.Module):
                 num_views=num_views,
                 patch_geometry=patch_geometry,
                 depth=depth,
+                geometry_local_aux=geometry_local_aux,
+                geometry_local_aux_active=geometry_local_aux_active,
+                geometry_local_aux_disable=geometry_local_aux_disable,
             )
-            return {"x": out, "repa_loss": None}
+            result = {"x": out, "repa_loss": None}
+            geometry_stats = getattr(
+                self.core,
+                "last_geometry_local_aux_stats",
+                None,
+            )
+            if geometry_stats is not None:
+                result["geometry_local_aux"] = geometry_stats
+            return result
         if y.dim() == 4:
             y_proc = y.squeeze(1)
         elif y.dim() == 3:
@@ -190,6 +249,9 @@ class PixDiTTrainer(nn.Module):
             num_views=num_views,
             patch_geometry=patch_geometry,
             depth=depth,
+            geometry_local_aux=geometry_local_aux,
+            geometry_local_aux_active=geometry_local_aux_active,
+            geometry_local_aux_disable=geometry_local_aux_disable,
         )
         repa_loss = None
         if repa_tokens is not None:
@@ -219,7 +281,15 @@ class PixDiTTrainer(nn.Module):
                 else:
                     repa_tokens = F.normalize(repa_tokens, dim=-1)
                     repa_loss = -((proj_tokens * repa_tokens).sum(dim=-1)).mean()
-        return {"x": out, "repa_loss": repa_loss}
+        result = {"x": out, "repa_loss": repa_loss}
+        geometry_stats = getattr(
+            self.core,
+            "last_geometry_local_aux_stats",
+            None,
+        )
+        if geometry_stats is not None:
+            result["geometry_local_aux"] = geometry_stats
+        return result
 
     def forward_with_dpmsolver(self, x, timestep, y=None, mask=None, **kwargs):
         out = self.forward(x, timestep, y, mask, **kwargs)
