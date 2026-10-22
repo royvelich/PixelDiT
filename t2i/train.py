@@ -542,7 +542,22 @@ def train(
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.train.gradient_clip)
+                    # [restore edit] A TSD-SR run owns an auxiliary LoRA
+                    # regularizer outside the student module hierarchy. It
+                    # shares this optimizer and therefore must participate in
+                    # the same unscale/clip operation.
+                    try:
+                        from restore.tsd_distillation import parameters_for_clipping
+
+                        _clip_parameters = parameters_for_clipping(
+                            model.parameters()
+                        )
+                    except ImportError:
+                        _clip_parameters = model.parameters()
+                    grad_norm = accelerator.clip_grad_norm_(
+                        _clip_parameters,
+                        config.train.gradient_clip,
+                    )
                     if not config.train.use_fsdp and config.train.ema_update and model_ema is not None:
                         ema_update(model_ema, model, config.train.ema_rate)
                     optimizer.step()
