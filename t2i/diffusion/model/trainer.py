@@ -88,6 +88,11 @@ class PixDiTTrainer(nn.Module):
                 "depth_channel_enabled": True,
                 "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
             }
+        pit_reference_flow = (
+            restore_cfg.pit_reference_flow
+            if restore_cfg is not None
+            else True
+        )
 
         if PixDiT_T2I is None:
             raise ImportError("Failed to import PixDiT_T2I from pixdit_core.pixeldit_t2i. Check repo layout and PYTHONPATH.")
@@ -109,6 +114,7 @@ class PixDiTTrainer(nn.Module):
             repa_encoder_index=repa_encoder_index,
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
+            pit_reference_flow=pit_reference_flow,
             **patch_geometry_kwargs,
             **depth_channel_kwargs,
         )

@@ -282,6 +282,7 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_dropout: float = 0.0,
         depth_channel_enabled: bool = False,
         depth_channel_dim: int = 1,
+        pit_reference_flow: bool = True,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -303,6 +304,7 @@ class PixDiT_T2I(nn.Module):
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.depth_channel_enabled = bool(depth_channel_enabled)
         self.depth_channel_dim = int(depth_channel_dim)
+        self.pit_reference_flow = bool(pit_reference_flow)
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
             raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
@@ -629,7 +631,61 @@ class PixDiT_T2I(nn.Module):
         if depth is not None:
             x_pixels = x_pixels + self._embed_pixel_depth(depth, H, W)
         for blk in self.pixel_blocks:
-            x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask)
+            if self.pit_reference_flow or num_views == 1:
+                x_pixels = blk(
+                    x_pixels,
+                    s_cond,
+                    H,
+                    W,
+                    self.patch_size,
+                    mask,
+                )
+                continue
+
+            # The DiT blocks above still jointly evolve render/reference patch
+            # tokens. At pixel level, only the render row traverses PiT.
+            sample_batch = B // num_views
+            pixel_shape = x_pixels.shape[1:]
+            pixel_views = x_pixels.view(
+                sample_batch,
+                num_views,
+                L,
+                *pixel_shape,
+            )
+            render_pixels = pixel_views[:, 0].reshape(
+                sample_batch * L,
+                *pixel_shape,
+            )
+            condition_views = s_cond.view(
+                sample_batch,
+                num_views,
+                L,
+                self.hidden_size,
+            )
+            render_condition = condition_views[:, 0].reshape(
+                sample_batch * L,
+                self.hidden_size,
+            )
+            render_pixels = blk(
+                render_pixels,
+                render_condition,
+                H,
+                W,
+                self.patch_size,
+                mask,
+            )
+            x_pixels = torch.cat(
+                [
+                    render_pixels.view(
+                        sample_batch,
+                        1,
+                        L,
+                        *pixel_shape,
+                    ),
+                    pixel_views[:, 1:],
+                ],
+                dim=1,
+            ).reshape(B * L, *pixel_shape)
 
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels
