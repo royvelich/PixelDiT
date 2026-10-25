@@ -67,6 +67,7 @@ class PixDiTTrainer(nn.Module):
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
         depth_channel_kwargs = {}
+        reference_knob_kwargs = {}
         try:
             from restore.config import get_active
 
@@ -87,6 +88,11 @@ class PixDiTTrainer(nn.Module):
             depth_channel_kwargs = {
                 "depth_channel_enabled": True,
                 "depth_channel_dim": restore_cfg.depth_conditioning_channels(),
+            }
+        if restore_cfg is not None and restore_cfg.knob_map:
+            reference_knob_kwargs = {
+                "reference_knob_enabled": True,
+                "reference_knob_hidden_dim": restore_cfg.knob_hidden_dim,
             }
 
         if PixDiT_T2I is None:
@@ -111,6 +117,7 @@ class PixDiTTrainer(nn.Module):
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
             **depth_channel_kwargs,
+            **reference_knob_kwargs,
         )
 
         self.image_size = int(image_size)
@@ -148,6 +155,16 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        reference_knob = (
+            data_info.get("reference_knob")
+            if isinstance(data_info, dict)
+            else None
+        )
+        knob_pixel_input = (
+            data_info.get("knob_pixel_input")
+            if isinstance(data_info, dict)
+            else None
+        )
         if y is None:
             # Text stream disabled: nothing to squeeze, check or cast. The core skips every
             # text-shaped module rather than being fed zeros, so no text weight is touched.
@@ -162,6 +179,8 @@ class PixDiTTrainer(nn.Module):
                 num_views=num_views,
                 patch_geometry=patch_geometry,
                 depth=depth,
+                reference_knob=reference_knob,
+                knob_pixel_input=knob_pixel_input,
             )
             return {"x": out, "repa_loss": None}
         if y.dim() == 4:
@@ -190,6 +209,8 @@ class PixDiTTrainer(nn.Module):
             num_views=num_views,
             patch_geometry=patch_geometry,
             depth=depth,
+            reference_knob=reference_knob,
+            knob_pixel_input=knob_pixel_input,
         )
         repa_loss = None
         if repa_tokens is not None:

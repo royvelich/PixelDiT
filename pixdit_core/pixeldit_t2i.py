@@ -212,11 +212,21 @@ class MMDiTJointAttention(nn.Module):
 
 
 class MMDiTBlockT2I(nn.Module):
-    def __init__(self, hidden_size, groups, mlp_ratio=4.0, adaLN_modulation_img=None, adaLN_modulation_txt=None):
+    def __init__(
+        self,
+        hidden_size,
+        groups,
+        mlp_ratio=4.0,
+        adaLN_modulation_img=None,
+        adaLN_modulation_txt=None,
+        knob_enabled=False,
+        knob_hidden_dim=64,
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.groups = groups
         self.head_dim = hidden_size // groups
+        self.knob_enabled = bool(knob_enabled)
 
         self.norm_x1 = RMSNorm(hidden_size, eps=1e-6)
         self.norm_y1 = RMSNorm(hidden_size, eps=1e-6)
@@ -233,7 +243,27 @@ class MMDiTBlockT2I(nn.Module):
         self.adaLN_modulation_img = adaLN_modulation_img if adaLN_modulation_img is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.adaLN_modulation_txt = adaLN_modulation_txt if adaLN_modulation_txt is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
-    def forward(self, x, y, c, pos_img, pos_txt=None, attn_mask=None, num_views=1):
+        self.knob_embedder = None
+        if self.knob_enabled:
+            self.knob_embedder = nn.Sequential(
+                nn.Linear(1, int(knob_hidden_dim)),
+                nn.SiLU(),
+                nn.Linear(int(knob_hidden_dim), hidden_size),
+            )
+            nn.init.zeros_(self.knob_embedder[-1].weight)
+            nn.init.zeros_(self.knob_embedder[-1].bias)
+
+    def forward(
+        self,
+        x,
+        y,
+        c,
+        pos_img,
+        pos_txt=None,
+        attn_mask=None,
+        num_views=1,
+        reference_knob=None,
+    ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
         # exactly `c[::num_views]`. A no-op at num_views=1.
@@ -244,6 +274,31 @@ class MMDiTBlockT2I(nn.Module):
             shift_msa_y, scale_msa_y, gate_msa_y, shift_mlp_y, scale_mlp_y, gate_mlp_y = self.adaLN_modulation_txt(c_txt).chunk(6, dim=-1)
 
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
+        if self.knob_enabled:
+            if reference_knob is None:
+                raise ValueError(
+                    "knob-enabled patch block requires reference_knob"
+                )
+            if (
+                reference_knob.dim() != 3
+                or reference_knob.shape[:2] != x.shape[:2]
+                or reference_knob.shape[-1] != 1
+            ):
+                raise ValueError(
+                    "reference_knob must be [B*V,L,1] matching image tokens, "
+                    f"got {tuple(reference_knob.shape)} for x={tuple(x.shape)}"
+                )
+            knob_embedding = self.knob_embedder(reference_knob)
+            # Reference rows must receive exactly nothing, including no learned
+            # final-layer bias at k=0. Rows are b-major [render, ref0, ...].
+            render_rows = (
+                torch.arange(x.shape[0], device=x.device) % num_views == 0
+            ).to(x.dtype).view(-1, 1, 1)
+            x_norm = x_norm + knob_embedding * render_rows
+        elif reference_knob is not None:
+            raise ValueError(
+                "reference_knob was supplied to a block with knob_enabled=False"
+            )
         y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
         attn_x, attn_y = self.attn(x_norm, y_norm, pos_img, pos_txt, attn_mask, num_views)
         x = x + gate_msa_x * attn_x
@@ -282,6 +337,8 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_dropout: float = 0.0,
         depth_channel_enabled: bool = False,
         depth_channel_dim: int = 1,
+        reference_knob_enabled: bool = False,
+        reference_knob_hidden_dim: int = 64,
     ):
         super().__init__()
         self.in_channels = int(in_channels)
@@ -303,6 +360,8 @@ class PixDiT_T2I(nn.Module):
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
         self.depth_channel_enabled = bool(depth_channel_enabled)
         self.depth_channel_dim = int(depth_channel_dim)
+        self.reference_knob_enabled = bool(reference_knob_enabled)
+        self.reference_knob_hidden_dim = int(reference_knob_hidden_dim)
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
             raise ValueError("depth_channel_dim must be >= 1 when enabled")
         if self.pixel_depth <= 0:
@@ -323,6 +382,8 @@ class PixDiT_T2I(nn.Module):
                 self.num_groups,
                 adaLN_modulation_img=self._shared_cond_adaln_img,
                 adaLN_modulation_txt=self._shared_cond_adaln_txt,
+                knob_enabled=self.reference_knob_enabled,
+                knob_hidden_dim=self.reference_knob_hidden_dim,
             )
             for _ in range(self.patch_depth)
         ])
@@ -516,6 +577,74 @@ class PixDiT_T2I(nn.Module):
             )
         return geometry.to(device=device, dtype=dtype)
 
+    def _prepare_reference_knob(
+        self,
+        knob: torch.Tensor,
+        model_rows: int,
+        num_views: int,
+        token_count: int,
+        height: int,
+        width: int,
+        device,
+        dtype,
+    ) -> torch.Tensor:
+        """Area-pool target-view k and expand it to b-major view rows."""
+
+        if knob is None:
+            if self.reference_knob_enabled:
+                raise ValueError(
+                    "reference_knob_enabled=True requires a target-view knob map"
+                )
+            return None
+        if not self.reference_knob_enabled:
+            raise ValueError(
+                "reference knob was supplied but reference_knob_enabled=False"
+            )
+        if model_rows % num_views:
+            raise ValueError(
+                f"model rows {model_rows} are not divisible by num_views={num_views}"
+            )
+        samples = model_rows // num_views
+        if knob.dim() == 4:
+            if knob.shape[1] != 1 or tuple(knob.shape[-2:]) != (height, width):
+                raise ValueError(
+                    "pixel knob must be [B,1,H,W] with spatial shape "
+                    f"{(height, width)}, got {tuple(knob.shape)}"
+                )
+            knob = F.avg_pool2d(
+                knob.to(device=device, dtype=dtype),
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+            ).flatten(2).transpose(1, 2)
+        elif knob.dim() == 3:
+            if knob.shape[1:] != (token_count, 1):
+                raise ValueError(
+                    f"patch knob must be [B,{token_count},1], got "
+                    f"{tuple(knob.shape)}"
+                )
+            knob = knob.to(device=device, dtype=dtype)
+        else:
+            raise ValueError(
+                "reference knob must be [B,1,H,W] or [B,L,1], got "
+                f"{tuple(knob.shape)}"
+            )
+        if samples % knob.shape[0]:
+            raise ValueError(
+                f"knob batch {knob.shape[0]} does not divide sample batch {samples}"
+            )
+        if knob.shape[0] != samples:
+            knob = knob.repeat(samples // knob.shape[0], 1, 1)
+        if knob.shape[1] != token_count:
+            raise ValueError(
+                f"pooled knob token count {knob.shape[1]} != {token_count}"
+            )
+        if bool((knob < 0).any()) or bool((knob > 1).any()):
+            raise ValueError("reference knob values must lie in [0,1]")
+
+        rows = knob.new_zeros(samples, num_views, token_count, 1)
+        rows[:, 0] = knob
+        return rows.reshape(model_rows, token_count, 1)
+
     def forward(
         self,
         x,
@@ -526,6 +655,8 @@ class PixDiT_T2I(nn.Module):
         num_views=1,
         patch_geometry=None,
         depth=None,
+        reference_knob=None,
+        knob_pixel_input=None,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
         batch axis (row ``b*V + v``); see ``merge_views``. The views meet only inside the patch
@@ -540,6 +671,16 @@ class PixDiT_T2I(nn.Module):
         Hs = H // self.patch_size
         Ws = W // self.patch_size
         L = Hs * Ws
+        prepared_knob = self._prepare_reference_knob(
+            reference_knob,
+            B,
+            num_views,
+            L,
+            H,
+            W,
+            x.device,
+            x.dtype,
+        )
         depth = self._prepare_depth(
             depth,
             B,
@@ -608,7 +749,16 @@ class PixDiT_T2I(nn.Module):
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
+                s, y_emb = self.patch_blocks[i](
+                    s,
+                    y_emb,
+                    condition,
+                    pos,
+                    pos_txt,
+                    attn_mask_joint,
+                    num_views,
+                    reference_knob=prepared_knob,
+                )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
@@ -625,7 +775,31 @@ class PixDiT_T2I(nn.Module):
             length = L
 
         s_cond = s.view(B * L, self.hidden_size)
-        x_pixels = self.pixel_embedder(x, img_height=H, img_width=W, patch_size=self.patch_size)
+        pixel_input = x
+        if knob_pixel_input is not None:
+            if not self.reference_knob_enabled:
+                raise ValueError(
+                    "knob_pixel_input was supplied but reference knob is disabled"
+                )
+            if (
+                knob_pixel_input.dim() != 4
+                or knob_pixel_input.shape[1:] != x.shape[1:]
+                or B % knob_pixel_input.shape[0]
+            ):
+                raise ValueError(
+                    "knob_pixel_input must be [B*V,C,H,W] matching x, or "
+                    f"divide its batch; got {tuple(knob_pixel_input.shape)} "
+                    f"for x={tuple(x.shape)}"
+                )
+            pixel_input = knob_pixel_input.to(device=x.device, dtype=x.dtype)
+            if pixel_input.shape[0] != B:
+                pixel_input = pixel_input.repeat(B // pixel_input.shape[0], 1, 1, 1)
+        x_pixels = self.pixel_embedder(
+            pixel_input,
+            img_height=H,
+            img_width=W,
+            patch_size=self.patch_size,
+        )
         if depth is not None:
             x_pixels = x_pixels + self._embed_pixel_depth(depth, H, W)
         for blk in self.pixel_blocks:
