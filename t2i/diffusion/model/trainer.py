@@ -66,6 +66,7 @@ class PixDiTTrainer(nn.Module):
         use_pixel_abs_pos = bool(extra.get("use_pixel_abs_pos", True))
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
+        patch_correspondence_kwargs = {}
         depth_channel_kwargs = {}
         try:
             from restore.config import get_active
@@ -79,6 +80,22 @@ class PixDiTTrainer(nn.Module):
                 "patch_geometry_input_dim": 11,
                 "patch_geometry_hidden_dim": restore_cfg.patch_geometry_hidden_dim,
                 "patch_geometry_dropout": restore_cfg.patch_geometry_dropout,
+            }
+        if (
+            restore_cfg is not None
+            and restore_cfg.patch_correspondence_pooling
+        ):
+            patch_correspondence_kwargs = {
+                "patch_correspondence_enabled": True,
+                "patch_correspondence_fusion": (
+                    restore_cfg.patch_correspondence_fusion
+                ),
+                "patch_correspondence_weighting": (
+                    restore_cfg.patch_correspondence_weighting
+                ),
+                "patch_correspondence_include_render": (
+                    restore_cfg.patch_correspondence_include_render
+                ),
             }
         if (
             restore_cfg is not None
@@ -110,6 +127,7 @@ class PixDiTTrainer(nn.Module):
             use_pixel_abs_pos=use_pixel_abs_pos,
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
+            **patch_correspondence_kwargs,
             **depth_channel_kwargs,
         )
 
@@ -143,6 +161,21 @@ class PixDiTTrainer(nn.Module):
             if isinstance(data_info, dict)
             else None
         )
+        patch_correspondence_indices = (
+            data_info.get("patch_correspondence_indices")
+            if isinstance(data_info, dict)
+            else None
+        )
+        patch_correspondence_valid = (
+            data_info.get("patch_correspondence_valid")
+            if isinstance(data_info, dict)
+            else None
+        )
+        patch_correspondence_support = (
+            data_info.get("patch_correspondence_support")
+            if isinstance(data_info, dict)
+            else None
+        )
         depth = (
             data_info.get("depth")
             if isinstance(data_info, dict)
@@ -161,6 +194,9 @@ class PixDiTTrainer(nn.Module):
                 mask=None,
                 num_views=num_views,
                 patch_geometry=patch_geometry,
+                patch_correspondence_indices=patch_correspondence_indices,
+                patch_correspondence_valid=patch_correspondence_valid,
+                patch_correspondence_support=patch_correspondence_support,
                 depth=depth,
             )
             return {"x": out, "repa_loss": None}
@@ -189,6 +225,9 @@ class PixDiTTrainer(nn.Module):
             mask=None,
             num_views=num_views,
             patch_geometry=patch_geometry,
+            patch_correspondence_indices=patch_correspondence_indices,
+            patch_correspondence_valid=patch_correspondence_valid,
+            patch_correspondence_support=patch_correspondence_support,
             depth=depth,
         )
         repa_loss = None

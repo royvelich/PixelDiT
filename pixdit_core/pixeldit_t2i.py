@@ -103,6 +103,168 @@ class PatchGeometryEmbedder(nn.Module):
         return self.proj_out(F.silu(self.proj_in(geometry)))
 
 
+class PatchCorrespondenceFusion(nn.Module):
+    """Fuse reference patch embeddings into render-aligned patch tokens.
+
+    The input rows remain b-major ``[render, ref0, ...]`` for compatibility
+    with the existing restoration runtime. Only render rows are replaced.
+    """
+
+    MODES = {"joint_mean", "joint_sum", "joint_max", "residual_mean"}
+
+    def __init__(
+        self,
+        hidden_size: int,
+        mode: str = "residual_mean",
+        weighting: str = "support",
+        include_render: bool = True,
+    ):
+        super().__init__()
+        if mode not in self.MODES:
+            raise ValueError(f"unsupported patch correspondence fusion {mode!r}")
+        if weighting not in {"uniform", "support"}:
+            raise ValueError(
+                f"patch correspondence weighting must be uniform|support, got {weighting!r}"
+            )
+        if mode == "residual_mean" and not include_render:
+            raise ValueError("residual_mean always includes the render token")
+        self.mode = mode
+        self.weighting = weighting
+        self.include_render = bool(include_render)
+        self.residual_projection = (
+            nn.Linear(hidden_size, hidden_size, bias=False)
+            if mode == "residual_mean"
+            else None
+        )
+        if self.residual_projection is not None:
+            # Exact pretrained identity at step zero, with nonzero gradients to
+            # the projection weights on the first optimization step.
+            nn.init.zeros_(self.residual_projection.weight)
+
+    @staticmethod
+    def _prepare(
+        tensor: torch.Tensor,
+        *,
+        samples: int,
+        num_refs: int,
+        token_count: int,
+        name: str,
+    ) -> torch.Tensor:
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"{name} must be [B,K,L,S], got {tuple(tensor.shape)}"
+            )
+        if tensor.shape[1] != num_refs or tensor.shape[2] != token_count:
+            raise ValueError(
+                f"{name} expected [B,{num_refs},{token_count},S], got "
+                f"{tuple(tensor.shape)}"
+            )
+        if samples % tensor.shape[0]:
+            raise ValueError(
+                f"{name} batch {tensor.shape[0]} does not divide model samples {samples}"
+            )
+        if tensor.shape[0] != samples:
+            tensor = tensor.repeat(samples // tensor.shape[0], 1, 1, 1)
+        return tensor
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        indices: torch.Tensor,
+        valid: torch.Tensor,
+        support: torch.Tensor,
+        num_views: int,
+    ) -> torch.Tensor:
+        if num_views < 2:
+            raise ValueError("patch correspondence fusion requires references")
+        if tokens.dim() != 3 or tokens.shape[0] % num_views:
+            raise ValueError(
+                f"tokens must be [B*V,L,D] divisible by V={num_views}"
+            )
+        samples = tokens.shape[0] // num_views
+        num_refs = num_views - 1
+        token_count, hidden_size = tokens.shape[1:]
+        indices = self._prepare(
+            indices,
+            samples=samples,
+            num_refs=num_refs,
+            token_count=token_count,
+            name="patch_correspondence_indices",
+        ).to(device=tokens.device, dtype=torch.long)
+        valid = self._prepare(
+            valid,
+            samples=samples,
+            num_refs=num_refs,
+            token_count=token_count,
+            name="patch_correspondence_valid",
+        ).to(device=tokens.device, dtype=torch.bool)
+        support = self._prepare(
+            support,
+            samples=samples,
+            num_refs=num_refs,
+            token_count=token_count,
+            name="patch_correspondence_support",
+        ).to(device=tokens.device, dtype=tokens.dtype)
+
+        views = tokens.view(samples, num_views, token_count, hidden_size)
+        render = views[:, 0]
+        refs = views[:, 1:]
+        slots = indices.shape[-1]
+        refs_flat = refs.reshape(samples * num_refs, token_count, hidden_size)
+        gather_index = indices.reshape(samples * num_refs, token_count * slots)
+        gathered = torch.gather(
+            refs_flat,
+            1,
+            gather_index[..., None].expand(-1, -1, hidden_size),
+        ).view(samples, num_refs, token_count, slots, hidden_size)
+        candidate_valid = valid[..., None]
+        has_reference = valid.any(dim=(1, 3))
+
+        if self.mode == "residual_mean":
+            weights = (
+                support
+                if self.weighting == "support"
+                else valid.to(tokens.dtype)
+            )
+            weights = weights * valid.to(weights.dtype)
+            denominator = weights.sum(dim=(1, 3)).clamp_min(1e-6)
+            pooled = (
+                gathered * weights[..., None]
+            ).sum(dim=(1, 3)) / denominator[..., None]
+            fused = render + self.residual_projection(pooled)
+        elif self.mode in {"joint_mean", "joint_sum"}:
+            reference_sum = torch.where(
+                candidate_valid, gathered, torch.zeros_like(gathered)
+            ).sum(dim=(1, 3))
+            reference_count = valid.sum(dim=(1, 3)).to(tokens.dtype)
+            if self.include_render:
+                fused = render + reference_sum
+                count = reference_count + 1
+            else:
+                fused = reference_sum
+                count = reference_count
+            if self.mode == "joint_mean":
+                fused = fused / count.clamp_min(1)[..., None]
+        else:
+            masked = torch.where(
+                candidate_valid,
+                gathered,
+                torch.full_like(gathered, -float("inf")),
+            )
+            reference_max = masked.amax(dim=(1, 3))
+            fused = (
+                torch.maximum(render, reference_max)
+                if self.include_render
+                else reference_max
+            )
+
+        fused = torch.where(has_reference[..., None], fused, render)
+        output = views.clone()
+        output[:, 0] = fused
+        return output.reshape_as(tokens)
+
+
 class MMDiTJointAttention(nn.Module):
     def __init__(
             self,
@@ -140,6 +302,7 @@ class MMDiTJointAttention(nn.Module):
             pos_txt: torch.Tensor = None,
             attn_mask: torch.Tensor = None,
             num_views: int = 1,
+            joint_views: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # y is None when the text stream is disabled: the attention then runs single-stream over
         # the image tokens alone. Everything text-shaped below is skipped rather than fed zeros, so
@@ -184,29 +347,50 @@ class MMDiTJointAttention(nn.Module):
             ky = ky.transpose(1, 2)
             vy = vy.transpose(1, 2)
 
-        # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so each view must get
-        # the same positional phase. Merging first would be identical here, but doing it last
-        # keeps the invariant obvious.
-        qx = merge_views(qx, num_views)
-        kx = merge_views(kx, num_views)
-        vx = merge_views(vx, num_views)
-
-        if text_on:
-            q_joint = torch.cat([qy, qx], dim=2)
-            k_joint = torch.cat([ky, kx], dim=2)
-            v_joint = torch.cat([vy, vx], dim=2)
+        if joint_views:
+            # Merge AFTER RoPE: every view shares the same H_s x W_s grid, so each view must get
+            # the same positional phase. Merging first would be identical here, but doing it last
+            # keeps the invariant obvious.
+            qx = merge_views(qx, num_views)
+            kx = merge_views(kx, num_views)
+            vx = merge_views(vx, num_views)
+            if text_on:
+                q_joint = torch.cat([qy, qx], dim=2)
+                k_joint = torch.cat([ky, kx], dim=2)
+                v_joint = torch.cat([vy, vx], dim=2)
+            else:
+                q_joint, k_joint, v_joint = qx, kx, vx
         else:
-            q_joint, k_joint, v_joint = qx, kx, vx
+            # Embedding-level correspondence fusion has already injected references into the
+            # render tokens. Keep subsequent image attention independent per view so unrestricted
+            # cross-view softmax cannot reintroduce the alignment/competition problem. Text stays
+            # sample-level; repeat the same normalized text keys/values for each image row and
+            # retain only the render row's updated text stream for the next block.
+            if text_on:
+                qy_rows = qy.repeat_interleave(num_views, dim=0)
+                ky_rows = ky.repeat_interleave(num_views, dim=0)
+                vy_rows = vy.repeat_interleave(num_views, dim=0)
+                q_joint = torch.cat([qy_rows, qx], dim=2)
+                k_joint = torch.cat([ky_rows, kx], dim=2)
+                v_joint = torch.cat([vy_rows, vx], dim=2)
+            else:
+                q_joint, k_joint, v_joint = qx, kx, vx
 
         out_joint = F.scaled_dot_product_attention(q_joint, k_joint, v_joint, dropout_p=0.0, attn_mask=attn_mask)
         n_txt = Ny if text_on else 0
-        out_x = split_views(out_joint[:, :, n_txt:, :], num_views, Nx)
+        out_x = out_joint[:, :, n_txt:, :]
+        if joint_views:
+            out_x = split_views(out_x, num_views, Nx)
         out_x = out_x.transpose(1, 2).reshape(B, Nx, C)
         out_x = self.proj_drop_x(self.proj_x(out_x))
 
         if not text_on:
             return out_x, None
-        out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(By, Ny, C)
+        out_y = out_joint[:, :, :Ny, :].transpose(1, 2).reshape(
+            B if not joint_views else By, Ny, C
+        )
+        if not joint_views:
+            out_y = out_y.view(By, num_views, Ny, C)[:, 0]
         out_y = self.proj_drop_y(self.proj_y(out_y))
         return out_x, out_y
 
@@ -233,7 +417,17 @@ class MMDiTBlockT2I(nn.Module):
         self.adaLN_modulation_img = adaLN_modulation_img if adaLN_modulation_img is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
         self.adaLN_modulation_txt = adaLN_modulation_txt if adaLN_modulation_txt is not None else nn.Sequential(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
-    def forward(self, x, y, c, pos_img, pos_txt=None, attn_mask=None, num_views=1):
+    def forward(
+        self,
+        x,
+        y,
+        c,
+        pos_img,
+        pos_txt=None,
+        attn_mask=None,
+        num_views=1,
+        joint_views=True,
+    ):
         # `c` is per IMAGE row, i.e. at B*V. The text stream is at B, so its modulation must be
         # fed the render rows only: b-major rows mean sample b's render is row b*V, which is
         # exactly `c[::num_views]`. A no-op at num_views=1.
@@ -245,7 +439,15 @@ class MMDiTBlockT2I(nn.Module):
 
         x_norm = apply_adaln(self.norm_x1(x), shift_msa_x, scale_msa_x)
         y_norm = apply_adaln(self.norm_y1(y), shift_msa_y, scale_msa_y) if text_on else None
-        attn_x, attn_y = self.attn(x_norm, y_norm, pos_img, pos_txt, attn_mask, num_views)
+        attn_x, attn_y = self.attn(
+            x_norm,
+            y_norm,
+            pos_img,
+            pos_txt,
+            attn_mask,
+            num_views,
+            joint_views,
+        )
         x = x + gate_msa_x * attn_x
         x = x + gate_mlp_x * self.mlp_x(apply_adaln(self.norm_x2(x), shift_mlp_x, scale_mlp_x))
         if not text_on:
@@ -280,6 +482,10 @@ class PixDiT_T2I(nn.Module):
         patch_geometry_input_dim: int = 11,
         patch_geometry_hidden_dim: int = 256,
         patch_geometry_dropout: float = 0.0,
+        patch_correspondence_enabled: bool = False,
+        patch_correspondence_fusion: str = "residual_mean",
+        patch_correspondence_weighting: str = "support",
+        patch_correspondence_include_render: bool = True,
         depth_channel_enabled: bool = False,
         depth_channel_dim: int = 1,
     ):
@@ -301,6 +507,9 @@ class PixDiT_T2I(nn.Module):
         self.use_pixel_abs_pos = bool(use_pixel_abs_pos)
         self.pit_adaln_post_modulation = bool(pit_adaln_post_modulation)
         self.patch_geometry_enabled = bool(patch_geometry_enabled)
+        self.patch_correspondence_enabled = bool(
+            patch_correspondence_enabled
+        )
         self.depth_channel_enabled = bool(depth_channel_enabled)
         self.depth_channel_dim = int(depth_channel_dim)
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
@@ -355,6 +564,15 @@ class PixDiT_T2I(nn.Module):
                 patch_geometry_hidden_dim,
                 self.hidden_size,
                 patch_geometry_dropout,
+            )
+
+        self.patch_correspondence_fusion = None
+        if self.patch_correspondence_enabled:
+            self.patch_correspondence_fusion = PatchCorrespondenceFusion(
+                self.hidden_size,
+                mode=patch_correspondence_fusion,
+                weighting=patch_correspondence_weighting,
+                include_render=patch_correspondence_include_render,
             )
 
         # Algebraically this is a projection of concatenated RGBD, split into the pretrained RGB
@@ -525,6 +743,9 @@ class PixDiT_T2I(nn.Module):
         mask=None,
         num_views=1,
         patch_geometry=None,
+        patch_correspondence_indices=None,
+        patch_correspondence_valid=None,
+        patch_correspondence_support=None,
         depth=None,
     ):
         """``num_views`` > 1 means ``x`` holds V views per sample, stacked **b-major** on the
@@ -586,6 +807,24 @@ class PixDiT_T2I(nn.Module):
                     s0.dtype,
                 )
                 s0 = s0 + self.patch_geometry_embedder(geometry, num_views)
+            if self.patch_correspondence_fusion is not None and num_views > 1:
+                supplied = (
+                    patch_correspondence_indices is not None,
+                    patch_correspondence_valid is not None,
+                    patch_correspondence_support is not None,
+                )
+                if not all(supplied):
+                    raise ValueError(
+                        "patch correspondence pooling requires indices, valid, "
+                        "and support tensors"
+                    )
+                s0 = self.patch_correspondence_fusion(
+                    s0,
+                    indices=patch_correspondence_indices,
+                    valid=patch_correspondence_valid,
+                    support=patch_correspondence_support,
+                    num_views=num_views,
+                )
             pos_txt = (self.fetch_pos_text(Ltxt, x.device)
                        if (text_on and self.use_text_rope) else None)
             attn_mask_joint = None
@@ -599,16 +838,36 @@ class PixDiT_T2I(nn.Module):
                     m = m.squeeze(1)
                 if m.dim() == 2:
                     pad = (m == 0)
-                    # The key axis is [text | V*L image tokens] at batch Btxt after the merge.
-                    # Image tokens are never padded, so their half stays all-False.
-                    pad_img = torch.zeros((Btxt, num_views * L), dtype=torch.bool, device=x.device)
-                    attn_mask_joint = torch.cat([pad[:, :Ltxt], pad_img], dim=1).view(
-                        Btxt, 1, 1, Ltxt + num_views * L
+                    joint_views = not self.patch_correspondence_enabled
+                    image_tokens = num_views * L if joint_views else L
+                    mask_batch = Btxt if joint_views else B
+                    pad_text = (
+                        pad[:, :Ltxt]
+                        if joint_views
+                        else pad[:, :Ltxt].repeat_interleave(num_views, dim=0)
                     )
+                    # Image tokens are never padded.
+                    pad_img = torch.zeros(
+                        (mask_batch, image_tokens),
+                        dtype=torch.bool,
+                        device=x.device,
+                    )
+                    attn_mask_joint = torch.cat(
+                        [pad_text, pad_img], dim=1
+                    ).view(mask_batch, 1, 1, Ltxt + image_tokens)
             self.last_repa_tokens = None
             s = s0
             for i in range(self.patch_depth):
-                s, y_emb = self.patch_blocks[i](s, y_emb, condition, pos, pos_txt, attn_mask_joint, num_views)
+                s, y_emb = self.patch_blocks[i](
+                    s,
+                    y_emb,
+                    condition,
+                    pos,
+                    pos_txt,
+                    attn_mask_joint,
+                    num_views,
+                    joint_views=not self.patch_correspondence_enabled,
+                )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
