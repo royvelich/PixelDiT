@@ -67,6 +67,7 @@ class PixDiTTrainer(nn.Module):
         pit_adaln_post_modulation = bool(extra.get("pit_adaln_post_modulation", False))
         patch_geometry_kwargs = {}
         patch_correspondence_kwargs = {}
+        late_ref_residual_kwargs = {}
         depth_channel_kwargs = {}
         try:
             from restore.config import get_active
@@ -95,6 +96,31 @@ class PixDiTTrainer(nn.Module):
                 ),
                 "patch_correspondence_include_render": (
                     restore_cfg.patch_correspondence_include_render
+                ),
+            }
+        if restore_cfg is not None and restore_cfg.late_ref_residual:
+            late_ref_residual_kwargs = {
+                "late_ref_residual_enabled": True,
+                "late_ref_residual_block": (
+                    restore_cfg.late_ref_residual_block
+                ),
+                "late_ref_residual_num_heads": (
+                    restore_cfg.late_ref_residual_num_heads
+                ),
+                "late_ref_residual_head_dim": (
+                    restore_cfg.late_ref_residual_head_dim
+                ),
+                "late_ref_residual_gate_hidden_dim": (
+                    restore_cfg.late_ref_residual_gate_hidden_dim
+                ),
+                "late_ref_residual_support_bias": (
+                    restore_cfg.late_ref_residual_support_bias
+                ),
+                "late_ref_residual_detach_reference": (
+                    restore_cfg.late_ref_residual_detach_reference
+                ),
+                "late_ref_residual_chunk_size": (
+                    restore_cfg.late_ref_residual_chunk_size
                 ),
             }
         if (
@@ -128,6 +154,7 @@ class PixDiTTrainer(nn.Module):
             pit_adaln_post_modulation=pit_adaln_post_modulation,
             **patch_geometry_kwargs,
             **patch_correspondence_kwargs,
+            **late_ref_residual_kwargs,
             **depth_channel_kwargs,
         )
 

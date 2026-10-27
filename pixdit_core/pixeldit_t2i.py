@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -265,6 +267,315 @@ class PatchCorrespondenceFusion(nn.Module):
         return output.reshape_as(tokens)
 
 
+class LateReferenceResidual(nn.Module):
+    """Inject geometry-aligned evolved reference tokens into render tokens.
+
+    Each reference gets an independent softmax over its local correspondence
+    candidates. A learned confidence gate controls that reference's contribution;
+    references never compete against one another or against render tokens in this
+    module. The output projection is zero initialized, so enabling the module is
+    an exact no-op before training.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        num_heads: int = 8,
+        head_dim: int = 64,
+        gate_hidden_dim: int = 128,
+        support_bias: float = 0.0,
+        detach_reference: bool = False,
+        chunk_size: int = 256,
+    ):
+        super().__init__()
+        if num_heads < 1 or head_dim < 1:
+            raise ValueError("num_heads and head_dim must be positive")
+        if gate_hidden_dim < 1:
+            raise ValueError("gate_hidden_dim must be positive")
+        if support_bias < 0:
+            raise ValueError("support_bias must be non-negative")
+        if chunk_size < 0:
+            raise ValueError("chunk_size must be non-negative")
+
+        self.hidden_size = int(hidden_size)
+        self.num_heads = int(num_heads)
+        self.head_dim = int(head_dim)
+        self.attention_dim = self.num_heads * self.head_dim
+        self.support_bias = float(support_bias)
+        self.detach_reference = bool(detach_reference)
+        self.chunk_size = int(chunk_size)
+
+        self.render_norm = RMSNorm(self.hidden_size)
+        self.reference_norm = RMSNorm(self.hidden_size)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.attention_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.attention_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.attention_dim, bias=False
+        )
+        # Gate features are render Q, aligned reference context, and four
+        # confidence statistics: best match, entropy, valid fraction, support.
+        self.gate = nn.Sequential(
+            nn.Linear(2 * self.attention_dim + 4, gate_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(gate_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+        self.out_proj = nn.Linear(
+            self.attention_dim, self.hidden_size, bias=False
+        )
+        nn.init.zeros_(self.out_proj.weight)
+        self.last_stats = None
+
+    @staticmethod
+    def _prepare(
+        tensor: torch.Tensor,
+        *,
+        samples: int,
+        num_refs: int,
+        token_count: int,
+        name: str,
+    ) -> torch.Tensor:
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"{name} must be [B,K,L,S], got {tuple(tensor.shape)}"
+            )
+        if tensor.shape[1] != num_refs or tensor.shape[2] != token_count:
+            raise ValueError(
+                f"{name} expected [B,{num_refs},{token_count},S], got "
+                f"{tuple(tensor.shape)}"
+            )
+        if samples % tensor.shape[0]:
+            raise ValueError(
+                f"{name} batch {tensor.shape[0]} does not divide model "
+                f"samples {samples}"
+            )
+        if tensor.shape[0] != samples:
+            tensor = tensor.repeat(samples // tensor.shape[0], 1, 1, 1)
+        return tensor
+
+    def _chunk_context(
+        self,
+        render_q: torch.Tensor,
+        reference_keys: torch.Tensor,
+        reference_values: torch.Tensor,
+        indices: torch.Tensor,
+        valid: torch.Tensor,
+        support: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return combined context, mean gate, and valid-reference fraction."""
+        samples, num_refs, chunk_tokens, slots = indices.shape
+        gather_index = indices.reshape(
+            samples * num_refs, chunk_tokens * slots
+        )
+        keys = torch.gather(
+            reference_keys,
+            1,
+            gather_index[..., None, None].expand(
+                -1, -1, self.num_heads, self.head_dim
+            ),
+        ).view(
+            samples,
+            num_refs,
+            chunk_tokens,
+            slots,
+            self.num_heads,
+            self.head_dim,
+        )
+        values = torch.gather(
+            reference_values,
+            1,
+            gather_index[..., None, None].expand(
+                -1, -1, self.num_heads, self.head_dim
+            ),
+        ).view(
+            samples,
+            num_refs,
+            chunk_tokens,
+            slots,
+            self.num_heads,
+            self.head_dim,
+        )
+        queries = render_q.view(
+            samples,
+            chunk_tokens,
+            self.num_heads,
+            self.head_dim,
+        )
+        scores = (
+            queries[:, None, :, None] * keys
+        ).sum(dim=-1).float() / math.sqrt(self.head_dim)
+        if self.support_bias:
+            scores = scores + (
+                self.support_bias
+                * torch.log1p(support.float())[..., None]
+            )
+
+        valid_heads = valid[..., None]
+        scores = scores.masked_fill(~valid_heads, -torch.inf)
+        has_candidate = valid.any(dim=-1)
+        # Avoid NaNs for render/reference pairs with no valid candidate.
+        scores = torch.where(
+            has_candidate[..., None, None],
+            scores,
+            torch.zeros_like(scores),
+        )
+        weights = torch.softmax(scores, dim=3).to(values.dtype)
+        weights = weights * valid_heads.to(weights.dtype)
+        weights = weights / weights.sum(dim=3, keepdim=True).clamp_min(1e-6)
+
+        context = (weights[..., None] * values).sum(dim=3).reshape(
+            samples,
+            num_refs,
+            chunk_tokens,
+            self.attention_dim,
+        )
+        query_features = render_q[:, None].expand(
+            -1, num_refs, -1, -1
+        )
+
+        best_match = weights.amax(dim=3).mean(dim=-1)
+        if slots > 1:
+            entropy = -(
+                weights.float()
+                * weights.float().clamp_min(1e-12).log()
+            ).sum(dim=3).mean(dim=-1) / math.log(slots)
+        else:
+            entropy = torch.zeros_like(best_match)
+        valid_fraction = valid.float().mean(dim=-1)
+        support_feature = torch.log1p(
+            support.float().sum(dim=-1)
+        )
+        gate_features = torch.cat(
+            [
+                query_features,
+                context,
+                best_match[..., None].to(context.dtype),
+                entropy[..., None].to(context.dtype),
+                valid_fraction[..., None].to(context.dtype),
+                support_feature[..., None].to(context.dtype),
+            ],
+            dim=-1,
+        )
+        gate = torch.sigmoid(self.gate(gate_features)).squeeze(-1)
+        gate = gate * has_candidate.to(gate.dtype)
+
+        # Average over the number of geometrically valid references. The gate
+        # retains its amplitude for K=1 and can suppress every reference.
+        valid_refs = has_candidate.sum(dim=1).clamp_min(1)
+        combined = (gate[..., None] * context).sum(dim=1)
+        combined = combined / valid_refs[..., None].to(combined.dtype)
+        gate_mean = gate.sum(dim=1) / valid_refs.to(gate.dtype)
+        valid_fraction_refs = has_candidate.float().mean(dim=1)
+        return combined, gate_mean, valid_fraction_refs
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        indices: torch.Tensor,
+        valid: torch.Tensor,
+        support: torch.Tensor,
+        num_views: int,
+    ) -> torch.Tensor:
+        if num_views < 2:
+            raise ValueError("late reference residual requires references")
+        if tokens.dim() != 3 or tokens.shape[0] % num_views:
+            raise ValueError(
+                f"tokens must be [B*V,L,D] divisible by V={num_views}"
+            )
+
+        samples = tokens.shape[0] // num_views
+        num_refs = num_views - 1
+        token_count, hidden_size = tokens.shape[1:]
+        if hidden_size != self.hidden_size:
+            raise ValueError(
+                f"token dim {hidden_size} != configured {self.hidden_size}"
+            )
+        indices = self._prepare(
+            indices,
+            samples=samples,
+            num_refs=num_refs,
+            token_count=token_count,
+            name="patch_correspondence_indices",
+        ).to(device=tokens.device, dtype=torch.long)
+        valid = self._prepare(
+            valid,
+            samples=samples,
+            num_refs=num_refs,
+            token_count=token_count,
+            name="patch_correspondence_valid",
+        ).to(device=tokens.device, dtype=torch.bool)
+        support = self._prepare(
+            support,
+            samples=samples,
+            num_refs=num_refs,
+            token_count=token_count,
+            name="patch_correspondence_support",
+        ).to(device=tokens.device, dtype=tokens.dtype)
+
+        views = tokens.view(samples, num_views, token_count, hidden_size)
+        render = views[:, 0]
+        refs_flat = views[:, 1:].reshape(
+            samples * num_refs, token_count, hidden_size
+        )
+        if self.detach_reference:
+            refs_flat = refs_flat.detach()
+        normalized_references = self.reference_norm(refs_flat)
+        reference_keys = self.k_proj(normalized_references).view(
+            samples * num_refs,
+            token_count,
+            self.num_heads,
+            self.head_dim,
+        )
+        reference_values = self.v_proj(normalized_references).view(
+            samples * num_refs,
+            token_count,
+            self.num_heads,
+            self.head_dim,
+        )
+        render_q = self.q_proj(self.render_norm(render))
+
+        chunk_size = self.chunk_size or token_count
+        contexts = []
+        gate_means = []
+        valid_fractions = []
+        for start in range(0, token_count, chunk_size):
+            end = min(start + chunk_size, token_count)
+            context, gate_mean, valid_fraction = self._chunk_context(
+                render_q[:, start:end],
+                reference_keys,
+                reference_values,
+                indices[:, :, start:end],
+                valid[:, :, start:end],
+                support[:, :, start:end],
+            )
+            contexts.append(context)
+            gate_means.append(gate_mean)
+            valid_fractions.append(valid_fraction)
+
+        combined = torch.cat(contexts, dim=1)
+        correction = self.out_proj(combined)
+        output = views.clone()
+        output[:, 0] = render + correction
+        self.last_stats = {
+            "gate_mean": torch.cat(gate_means, dim=1).detach(),
+            "valid_reference_fraction": torch.cat(
+                valid_fractions, dim=1
+            ).detach(),
+            "correction_rms": correction.detach().float().square().mean(
+                dim=-1
+            ).sqrt(),
+        }
+        return output.reshape_as(tokens)
+
+
 class MMDiTJointAttention(nn.Module):
     def __init__(
             self,
@@ -486,6 +797,14 @@ class PixDiT_T2I(nn.Module):
         patch_correspondence_fusion: str = "residual_mean",
         patch_correspondence_weighting: str = "support",
         patch_correspondence_include_render: bool = True,
+        late_ref_residual_enabled: bool = False,
+        late_ref_residual_block: int = 14,
+        late_ref_residual_num_heads: int = 8,
+        late_ref_residual_head_dim: int = 64,
+        late_ref_residual_gate_hidden_dim: int = 128,
+        late_ref_residual_support_bias: float = 0.0,
+        late_ref_residual_detach_reference: bool = False,
+        late_ref_residual_chunk_size: int = 256,
         depth_channel_enabled: bool = False,
         depth_channel_dim: int = 1,
     ):
@@ -510,6 +829,16 @@ class PixDiT_T2I(nn.Module):
         self.patch_correspondence_enabled = bool(
             patch_correspondence_enabled
         )
+        self.late_ref_residual_enabled = bool(
+            late_ref_residual_enabled
+        )
+        self.late_ref_residual_block = int(late_ref_residual_block)
+        if self.late_ref_residual_enabled and not (
+            1 <= self.late_ref_residual_block <= self.patch_depth
+        ):
+            raise ValueError(
+                "late_ref_residual_block must select an existing DiT block"
+            )
         self.depth_channel_enabled = bool(depth_channel_enabled)
         self.depth_channel_dim = int(depth_channel_dim)
         if self.depth_channel_enabled and self.depth_channel_dim < 1:
@@ -573,6 +902,18 @@ class PixDiT_T2I(nn.Module):
                 mode=patch_correspondence_fusion,
                 weighting=patch_correspondence_weighting,
                 include_render=patch_correspondence_include_render,
+            )
+
+        self.late_reference_residual = None
+        if self.late_ref_residual_enabled:
+            self.late_reference_residual = LateReferenceResidual(
+                self.hidden_size,
+                num_heads=late_ref_residual_num_heads,
+                head_dim=late_ref_residual_head_dim,
+                gate_hidden_dim=late_ref_residual_gate_hidden_dim,
+                support_bias=late_ref_residual_support_bias,
+                detach_reference=late_ref_residual_detach_reference,
+                chunk_size=late_ref_residual_chunk_size,
             )
 
         # Algebraically this is a projection of concatenated RGBD, split into the pretrained RGB
@@ -868,6 +1209,28 @@ class PixDiT_T2I(nn.Module):
                     num_views,
                     joint_views=not self.patch_correspondence_enabled,
                 )
+                if (
+                    self.late_reference_residual is not None
+                    and num_views > 1
+                    and (i + 1) == self.late_ref_residual_block
+                ):
+                    supplied = (
+                        patch_correspondence_indices is not None,
+                        patch_correspondence_valid is not None,
+                        patch_correspondence_support is not None,
+                    )
+                    if not all(supplied):
+                        raise ValueError(
+                            "late reference residual requires correspondence "
+                            "indices, valid, and support tensors"
+                        )
+                    s = self.late_reference_residual(
+                        s,
+                        indices=patch_correspondence_indices,
+                        valid=patch_correspondence_valid,
+                        support=patch_correspondence_support,
+                        num_views=num_views,
+                    )
                 if 0 < self.repa_encoder_index == (i + 1):
                     self.last_repa_tokens = s
             s = torch.nn.functional.silu(t_emb + s)
